@@ -1,0 +1,51 @@
+[project]
+name = "meeting-scribe"
+version = "1.0.0"
+description = "Meeting Scribe — Local-first, bot-free meeting transcription & document generation"
+requires-python = ">=3.11"
+authors = [
+    { name = "Areloa" }
+]
+
+dependencies = [
+    # ── CORE (always required) ──────────────────────────────────
+
+    # Audio capture
+    "PyAudioWPatch>=0.2.12",     # WASAPI loopback for system audio
+    "sounddevice>=0.5",           # Microphone capture
+    "soundfile>=0.12",            # Audio file I/O
+    "numpy>=1.26",                # Audio buffer math
+
+    # Local transcription (offline, no internet needed)
+    "faster-whisper>=1.1",        # CTranslate2-based Whisper
+    "huggingface-hub>=0.21",      # Model download manager
+
+    # Template & Document generation
+    "docxtpl>=0.18",              # Jinja2-based .docx rendering
+    "python-docx>=1.1",           # .docx read/write
+    "docx2pdf>=0.1.8",            # PDF export via MS Word COM
+
+    # UI
+    "PyQt6>=6.7",                 # Desktop GUI framework
+]
+
+[project.optional-dependencies]
+# Speaker diarization (requires free HuggingFace token)
+diarization = [
+    "torch>=2.1",
+    "pyannote.audio>=3.3",
+]
+
+# Local LLM structuring (requires Ollama installed separately)
+llm = [
+    "ollama>=0.4",
+]
+
+dev = [
+    "pytest>=8.0",
+    "pyinstaller>=6.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends._legacy:_Backend"

@@ -1,0 +1,46 @@
+# Meeting Scribe — Python dependencies (Windows, Python 3.10+)
+#
+# Install with:
+#   python -m venv venv
+#   .\venv\Scripts\activate
+#   pip install -r requirements.txt
+
+# ── UI ──────────────────────────────────────────────────────────────────
+PyQt6>=6.6.0
+
+# ── Audio capture (Windows) ─────────────────────────────────────────────
+sounddevice>=0.4.6
+PyAudioWPatch>=0.2.12   # WASAPI loopback support for system audio
+soundfile>=0.12.1       # WAV / FLAC / OGG read+write
+numpy>=1.24.0
+
+# ── Local transcription ─────────────────────────────────────────────────
+faster-whisper>=1.0.0
+ctranslate2>=4.0.0      # inference backend used by faster-whisper
+
+# ── Speaker diarization (optional but supported) ────────────────────────
+# Requires a free HuggingFace token to download the model on first run.
+pyannote.audio>=3.1.0
+torch>=2.1.0            # required by pyannote
+torchaudio>=2.1.0
+
+# ── LLM backends (optional) ─────────────────────────────────────────────
+ollama>=0.1.7           # local LLM via Ollama
+# anthropic and openai SDKs are NOT required — the structurer falls back to
+# raw urllib HTTP calls so the app stays light. Install only if you want
+# their convenience features:
+# anthropic>=0.25.0
+# openai>=1.30.0
+
+# ── Templates & document generation ─────────────────────────────────────
+docxtpl>=0.16.7         # Jinja2-style placeholders in .docx templates
+python-docx>=1.1.0      # underlying .docx manipulation
+docx2pdf>=0.1.8         # .docx → .pdf (requires MS Word on Windows)
+Jinja2>=3.1.0
+
+# ── Cloud transcription (optional, Groq backend) ────────────────────────
+httpx>=0.27.0           # HTTP client for the Groq STT backend
+
+# ── Misc ────────────────────────────────────────────────────────────────
+# Pin nothing else aggressively — sub-dependencies of the above will pull
+# in compatible versions of huggingface_hub, transformers, tokenizers, etc.

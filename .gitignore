@@ -1,0 +1,59 @@
+# ─── Python ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ─── Virtual environment ─────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ─── Node (leftover from docx template build tooling) ────────────────────
+node_modules/
+package-lock.json
+outputs/node_modules/
+outputs/package.json
+outputs/package-lock.json
+*.js.map
+
+# ─── App working data — never commit ─────────────────────────────────────
+# Scratch/build artifacts
+outputs/
+hasil/
+# Local meeting data (audio, transcripts, generated documents)
+meetings/
+*.mscribe
+*.request.md
+
+# ─── AI models (large, downloaded on first run) ──────────────────────────
+models/
+*.bin
+*.pt
+*.onnx
+
+# ─── Secrets & local config ──────────────────────────────────────────────
+# API keys live in the app's settings.json under %APPDATA%, but guard anyway
+.env
+*.key
+settings.local.json
+
+# ─── OS / editor ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# ─── Logs & temp ─────────────────────────────────────────────────────────
+*.log
+logs/
+temp/
+*.tmp
+*.wav
+*.opus
+*.flac

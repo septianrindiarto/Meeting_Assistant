@@ -1,0 +1,1 @@
+# Meeting Scribe source package
