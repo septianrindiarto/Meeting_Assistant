@@ -138,9 +138,13 @@ The assistant marks the request **DONE** when finished, so nothing is produced t
 
 ## 6. Generating documents
 
-1. Open a meeting (from Home, or right after processing).
-2. In the **Documents** panel (right side), select a template — the app ships with Minutes of Meeting, Decision Log, Interview Notes, One-on-One Recap and more.
-3. Click **Generate Document**. A `.docx` (and PDF, if MS Word is installed) is created — double-click it in *Generated Files* to open.
+The **Documents** panel (right side) has three buttons, for three ways to turn a meeting into a document:
+
+**Generate from Template** — fills a fixed `.docx` template with the meeting's data. Select a template (the app ships with Minutes of Meeting, Decision Log, Interview Notes, One-on-One Recap and more), click the button, and a `.docx` (plus PDF if MS Word is installed) appears in *Generated Files* — double-click to open. Same layout every time; best for formal formats.
+
+**✨ Ask AI for a Document** — describe any document you want and the AI writes it from the transcript. Pick a preset (formal MoM, MoM in Bahasa, executive summary, follow-up email, client report, decision log) or type your own instruction. Needs an AI backend configured (Groq is free — see section 8). The finished `.docx` opens automatically.
+
+**📄 Export Transcript** — saves the transcript as `.txt` or `.md`. No AI needed, always free. Paste the result into [claude.ai](https://claude.ai) or any AI chat and ask for whatever document you want. This is also the easiest way to get the raw transcript out of a meeting.
 
 ### Make your own template
 
@@ -217,6 +221,17 @@ Local transcription of a 2–3 hour recording takes 1–3 hours of CPU time. The
 
 **Moving to a new PC:** point the project folder at a synced location (OneDrive/Dropbox). On the new machine, install the app and select the same folder — your meetings reappear. No account, no cloud lock-in: bundles are ordinary ZIP files with open formats inside.
 
+### Storage & automatic cleanup
+
+Transcription needs a temporary working copy of the audio — an imported mp4/mp3 is decoded to about **115 MB per hour of audio** while it's being processed. Without management this would pile up, so the app cleans up on its own:
+
+- **After Save Bundle** — the audio is now inside the `.mscribe`, so the working copies are deleted automatically (you'll see "freed 340 MB" in the status bar).
+- **On startup** — anything orphaned by a crash or force-quit older than 24 hours is purged.
+- **Cancel a transcription** — the app asks whether to keep the meeting or discard it and free the temp audio.
+- **Manual** — **Settings → Storage** shows a live breakdown (recordings / imports / models / cloud jobs) with a **🧹 Clean Now** button.
+
+Your saved `.mscribe` bundles, transcripts and generated documents are **never** touched by cleanup — only the app's own temp area. Compressed bundles are small (~25 MB per audio-hour). You can adjust the retention window or turn off auto-cleanup in Settings → Storage.
+
 ---
 
 ## 10. Choosing quality vs speed (cheat sheet)
@@ -260,14 +275,20 @@ Meeting Assistant/
 |   |   |-- groq_transcriber.py# Groq cloud backend (chunking, resume, quota)
 |   |   |-- media_import.py    # mp3/mp4/... direct decode
 |   |   |-- diarizer.py        # Speaker identification (optional)
-|   |   |-- structurer.py      # LLM summaries/actions (optional)
+|   |   |-- structurer.py      # LLM summaries/actions + free-form docs
+|   |   |-- markdown_docx.py   # Converts AI markdown output to .docx
 |   |   |-- template_engine.py # docxtpl rendering
 |   |   |-- bundle_manager.py  # .mscribe bundles
 |   |   |-- database.py        # SQLite FTS5 search index
 |   |   |-- pipeline.py        # Orchestrator
 |   |-- ui/                    # PyQt6 interface
 |   |-- utils/
+|   |   |-- housekeeping.py    # Temp-storage cleanup
+|   |   |-- audio_utils.py     # Mixing, resampling, normalization
+|   |   |-- file_utils.py      # Paths & safe file I/O
+|   |   |-- hardware_probe.py  # Model auto-selection
 |-- templates/                 # Starter .docx templates
+|-- meetings/                  # Saved bundles + transcripts (git-ignored)
 |-- venv/
 ```
 
@@ -309,4 +330,4 @@ Click Home again (it refreshes) or use the search bar. If the index is ever corr
 
 ---
 
-*Meeting Scribe v1.0.0 — built with faster-whisper, PyQt6, pyannote, docxtpl. Runs entirely on your machine unless you choose otherwise. Cost per meeting: $0.*
+*Meeting Scribe v1.0.0 — built with faster-whisper, PyQt6, pyannote, docxtpl, Groq. Local recording & transcription, real-time draft, mp3/mp4 import, free Groq cloud transcription with resume, AI document generation, and automatic storage cleanup. Runs entirely on your machine unless you choose otherwise. Cost per meeting: $0.*
