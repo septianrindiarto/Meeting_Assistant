@@ -22,8 +22,31 @@ from src.core.template_engine import TemplateEngine
 from src.core.bundle_manager import BundleManager
 from src.core.database import MeetingDatabase
 from src.core.settings import Settings
-from src.utils.audio_utils import concatenate_chunks, format_duration, get_audio_duration
-from src.utils.file_utils import get_temp_dir
+from src.utils.audio_utils import (
+    concatenate_chunks, concat_wavs_streaming, format_duration,
+    get_audio_duration, wav_duration,
+)
+from src.utils.file_utils import get_temp_dir, get_app_data_dir, safe_read_json, safe_write_json
+from src.core.import_plan import ImportPlan, DOCUMENTS, context_markdown
+
+_UNSET = object()
+# Roughly the most a single free-tier Groq LLM request can take. Longer
+# transcripts skip the automatic Analysis panel instead of failing.
+MAX_ANALYSIS_CHARS = 60_000
+
+
+def _ts(seconds: float) -> str:
+    """m:ss under an hour, h:mm:ss above."""
+    s = int(seconds or 0)
+    if s >= 3600:
+        return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}"
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def _import_jobs_dir() -> str:
+    d = os.path.join(str(get_app_data_dir()), "import_jobs")
+    os.makedirs(d, exist_ok=True)
+    return d
 
 logger = logging.getLogger(__name__)
 
@@ -84,12 +107,16 @@ class MeetingPipeline:
         # Temp working audio (decoded import / concatenated recording) so it
         # can be cleaned up on save, cancel, or error.
         self._working_audio_path: Optional[str] = None
+        self._working_audio_paths: List[str] = []   # decoded import parts etc.
+        self._current_import_job: Optional[str] = None
 
         # Callbacks
         self.on_state_change: Optional[Callable[[str], None]] = None
         self.on_progress: Optional[Callable[[str], None]] = None
         self._on_level_change: Optional[Callable[[float], None]] = None
         self.on_transcript_update: Optional[Callable[[List[TranscriptSegment]], None]] = None
+        # (level, message) — device switches / warnings during recording
+        self.on_device_event: Optional[Callable[[str, str], None]] = None
 
     # Use a property so that assigning a level callback at any point — even
     # AFTER recording has started — still propagates to the live capture engine.
@@ -146,12 +173,16 @@ class MeetingPipeline:
             )
         )
 
-        # Create capture engine
+        # Create capture engine. Devices are chosen by name; "" = Automatic
+        # (first Bluetooth headset connected, otherwise Windows defaults).
         self._capture_engine = AudioCaptureEngine(
             source=source,
-            mic_device=self.settings.get("mic_device_index"),
-            system_device=self.settings.get("system_device_index"),
+            mic_device=self.settings.get("mic_device") or None,
+            system_device=self.settings.get("system_device") or None,
+            prefer_bluetooth=bool(self.settings.get("prefer_bluetooth", True)),
+            bluetooth_mode=self.settings.get("bluetooth_mode", "both") or "both",
         )
+        self._capture_engine.on_device_event = self._on_device_event
 
         # Wire level callback for waveform display BEFORE starting capture
         # so the very first audio chunks update the UI immediately.
@@ -173,6 +204,16 @@ class MeetingPipeline:
         self._capture_engine.start()
         self._set_state(PipelineState.RECORDING)
         self._report_progress(f"Recording started: {title}")
+
+    def _on_device_event(self, level: str, message: str) -> None:
+        """Forward device switches / warnings from the capture engine."""
+        if level in ("warning", "error"):
+            self._report_progress(message)
+        if self.on_device_event:
+            try:
+                self.on_device_event(level, message)
+            except Exception:
+                pass
 
     def _on_live_segments(self, segments: List[TranscriptSegment]) -> None:
         """Append live segments to the transcript and notify the UI.
@@ -213,6 +254,13 @@ class MeetingPipeline:
                 self._live.stop(flush=True)
                 self._live = None
             self.meeting.chunk_paths = chunk_paths
+            # Keep device switches / warnings with the meeting: they explain
+            # any gaps in the audio to whoever reads the transcript later.
+            self.meeting.metadata.recording_events = [
+                {"at": round(e.get("at", 0), 1), "level": e.get("level"),
+                 "message": e.get("message")}
+                for e in getattr(self._capture_engine, "events", [])
+            ]
 
             # Concatenate chunks into a single file
             if chunk_paths:
@@ -321,7 +369,6 @@ class MeetingPipeline:
         backend = self.settings.get_llm_backend()
         if backend != LLMBackend.NONE:
             self._set_state(PipelineState.STRUCTURING)
-            self._report_progress("Extracting action items and decisions...")
             self._structure()
 
         self._set_state(PipelineState.IDLE)
@@ -349,56 +396,69 @@ class MeetingPipeline:
         return _progress
 
     def _transcribe(self, audio_path: str) -> None:
-        """Run transcription using the configured backend.
+        """Transcribe the current meeting's audio (recordings / Process)."""
+        segments = self._transcribe_to_segments(audio_path)
+        self.meeting.transcript = segments
+        if self.on_transcript_update:
+            self.on_transcript_update(segments)
+
+    def _default_partial(self, segments_so_far) -> None:
+        self.meeting.transcript = segments_so_far
+        if self.on_transcript_update:
+            try:
+                self.on_transcript_update(list(segments_so_far))
+            except Exception:
+                pass
+
+    def _transcribe_to_segments(self, audio_path: str, language=_UNSET,
+                                prompt: Optional[str] = None,
+                                job_key: Optional[str] = None,
+                                on_partial: Optional[Callable] = None,
+                                label: str = "Transcribing") -> List[TranscriptSegment]:
+        """Run transcription with the configured backend and return segments.
 
         ROLLBACK MECHANISM: if the cloud backend (Groq) fails for any reason
         — bad key, quota exhausted, network down — and fallback is enabled,
-        we automatically re-run the file through the local Whisper backend
-        so the user always ends up with a transcript.
+        the same audio is transcribed with local Whisper instead, so the user
+        always ends up with a transcript.
         """
+        if language is _UNSET:
+            language = self.settings.get("transcription_language")
         backend = self.settings.get("stt_backend", "local")
 
         if backend == "groq":
             try:
-                self._transcribe_groq(audio_path)
-                return
+                return self._transcribe_groq(audio_path, language, prompt,
+                                             job_key, on_partial, label)
             except Exception as e:
                 # User cancellation is not a failure — don't roll over to local.
                 if self._transcriber is not None and \
                         getattr(self._transcriber, "cancel_requested", False):
                     raise
-
                 logger.error(f"Groq backend failed: {e}", exc_info=True)
-
                 if not self.settings.get("cloud_stt_fallback_local", True):
                     raise
-
-                # Keep any partial cloud segments as a floor; the local pass
-                # will overwrite them with a complete transcript if it succeeds.
                 partial = getattr(e, "partial_segments", [])
                 if partial:
-                    self.meeting.transcript = partial
-                    if self.on_transcript_update:
-                        self.on_transcript_update(list(partial))
-
+                    (on_partial or self._default_partial)(list(partial))
                 self._report_progress(
                     f"Cloud transcription failed ({str(e)[:80]}) — "
                     "rolling back to local Whisper..."
                 )
 
-        self._transcribe_local(audio_path)
+        return self._transcribe_local(audio_path, language, prompt, label)
 
-    def _transcribe_groq(self, audio_path: str) -> None:
+    def _transcribe_groq(self, audio_path: str, language, prompt, job_key,
+                         on_partial, label) -> List[TranscriptSegment]:
         """Transcribe via Groq's hosted Whisper (free tier friendly).
 
         Long jobs are crash-safe: every completed chunk is persisted to a
         job file under the app data dir, so closing the app mid-wait (e.g.
-        during the hourly quota pause) loses nothing — clicking Process
-        again resumes from the last finished chunk.
+        during the hourly quota pause) loses nothing — running it again
+        resumes from the last finished chunk.
         """
         from src.core.groq_transcriber import GroqTranscriber
         from src.core.transcriber import WhisperTranscriber
-        from src.utils.file_utils import get_app_data_dir
 
         api_key = self.settings.get("groq_api_key", "")
         if not api_key:
@@ -407,41 +467,25 @@ class MeetingPipeline:
                 "Transcription Backend, or switch backend to Local."
             )
 
-        jobs_dir = str(get_app_data_dir() / "cloud_jobs")
-
         self._transcriber = GroqTranscriber(
             api_key=api_key,
             model=self.settings.get("groq_model", "whisper-large-v3-turbo"),
-            language=self.settings.get("transcription_language"),
-            prompt=WhisperTranscriber.CODE_MIXED_PROMPT,
-            resume_dir=jobs_dir,
+            language=language,
+            prompt=prompt or WhisperTranscriber.CODE_MIXED_PROMPT,
+            resume_dir=str(get_app_data_dir() / "cloud_jobs"),
         )
         self._transcriber.on_status = self._report_progress
+        self._transcriber.on_partial = on_partial or self._default_partial
 
-        # Stream the growing transcript into the UI as chunks finish, and
-        # keep meeting.transcript current so even a hard crash mid-job
-        # leaves the meeting object with everything transcribed so far.
-        def _on_partial(segments_so_far):
-            self.meeting.transcript = segments_so_far
-            if self.on_transcript_update:
-                try:
-                    self.on_transcript_update(list(segments_so_far))
-                except Exception:
-                    pass
-
-        self._transcriber.on_partial = _on_partial
-
-        self._report_progress("Transcribing via Groq cloud (fast)...")
-        segments = self._transcriber.transcribe_file(
+        self._report_progress(f"{label} via Groq cloud...")
+        return self._transcriber.transcribe_file(
             audio_path,
-            on_progress=self._make_progress_reporter("Cloud transcribing"),
+            on_progress=self._make_progress_reporter(f"{label} (cloud)"),
+            job_key=job_key,
         )
 
-        self.meeting.transcript = segments
-        if self.on_transcript_update:
-            self.on_transcript_update(segments)
-
-    def _transcribe_local(self, audio_path: str) -> None:
+    def _transcribe_local(self, audio_path: str, language, prompt,
+                          label: str = "Transcribing") -> List[TranscriptSegment]:
         """Transcribe with local faster-whisper."""
         from src.core.transcriber import WhisperTranscriber
 
@@ -449,32 +493,209 @@ class MeetingPipeline:
         if model_size == "auto":
             model_size = None  # WhisperTranscriber will auto-detect
 
-        language = self.settings.get("transcription_language")
-        quality_preset = self.settings.get("whisper_quality", "balanced")
-
         self._transcriber = WhisperTranscriber(
             model_size=model_size,
             language=language,
-            quality_preset=quality_preset,
+            quality_preset=self.settings.get("whisper_quality", "balanced"),
         )
-
         self._report_progress(
             f"Loading Whisper model '{self._transcriber.model_size}' "
             "(first use downloads it — this can take a few minutes)..."
         )
         self._transcriber._ensure_loaded()
-        self._report_progress(
-            f"Transcribing with '{self._transcriber.model_size}' model..."
-        )
-
-        segments = self._transcriber.transcribe_file(
+        self._report_progress(f"{label} with '{self._transcriber.model_size}' model...")
+        return self._transcriber.transcribe_file(
             audio_path,
-            on_progress=self._make_progress_reporter(),
+            on_progress=self._make_progress_reporter(label),
+            initial_prompt=prompt,
         )
-        self.meeting.transcript = segments
 
-        if self.on_transcript_update:
-            self.on_transcript_update(segments)
+    # ─── Import Wizard: multi-part, resumable ────────────────────
+
+    @staticmethod
+    def _shift(seg: TranscriptSegment, offset: float) -> TranscriptSegment:
+        d = seg.to_dict()
+        d["start"] = seg.start + offset
+        d["end"] = seg.end + offset
+        return TranscriptSegment(**d)
+
+    def _metadata_from_plan(self, plan: ImportPlan) -> MeetingMetadata:
+        docs = list(plan.requested_documents)
+        if plan.custom_document.strip():
+            docs.append("custom")
+        instructions = plan.document_instructions.strip()
+        if plan.custom_document.strip():
+            instructions = (instructions + "\n" if instructions else "") + \
+                f"Custom document requested: {plan.custom_document.strip()}"
+        title = plan.title.strip() or os.path.splitext(plan.parts[0].name)[0]
+        return MeetingMetadata(
+            title=title,
+            date=plan.date or datetime.now().strftime("%Y-%m-%d"),
+            app_version="1.0.0",
+            client=plan.client.strip(),
+            engagement=plan.engagement.strip(),
+            meeting_type=plan.meeting_type,
+            our_role=plan.our_role,
+            topic=plan.topic.strip(),
+            participants=[p.strip() for p in plan.participants if p.strip()],
+            key_terms=plan.key_terms,
+            language=plan.language_label if plan.language else "Auto-detect",
+            document_language=plan.document_language,
+            document_instructions=instructions,
+            requested_documents=docs,
+        )
+
+    def run_import(self, plan: ImportPlan) -> None:
+        """Transcribe one or more media files as ONE meeting.
+
+        Each part is decoded and transcribed on its own (keeps memory low),
+        its timestamps are shifted onto one continuous timeline, and progress
+        is saved after every part so an interrupted import resumes where it
+        stopped — finished parts are never transcribed again.
+        """
+        from src.core.media_import import decode_media_to_wav
+        from src.core.transcriber import WhisperTranscriber
+
+        if not plan.parts:
+            raise ValueError("No files to import")
+
+        job_path = os.path.join(_import_jobs_dir(), f"import_{plan.job_id}.json")
+        job = safe_read_json(job_path) or {}
+        if job.get("job_id") != plan.job_id:
+            job = {"job_id": plan.job_id, "parts": {}, "created": time.time()}
+        job["plan"] = plan.to_dict()          # latest wizard answers win
+        job["status"] = "running"
+        safe_write_json(job_path, job)
+        self._current_import_job = job_path
+
+        self.meeting = Meeting(metadata=self._metadata_from_plan(plan))
+        self._working_audio_paths = []
+        prompt = plan.vocabulary_prompt(WhisperTranscriber.CODE_MIXED_PROMPT)
+        temp_dir = str(get_temp_dir())
+        n = len(plan.parts)
+
+        self._set_state(PipelineState.TRANSCRIBING)
+        all_segments: List[TranscriptSegment] = []
+        source_files: List[dict] = []
+        offset = 0.0
+
+        for i, part in enumerate(plan.parts):
+            label = f"Part {i + 1} of {n}" if n > 1 else "Transcribing"
+            wav = os.path.join(temp_dir, f"import_{plan.job_id}_part{i + 1}.wav")
+            self._working_audio_paths.append(wav)
+            if not os.path.exists(wav):
+                self._report_progress(f"{label}: reading audio from '{part.name}'...")
+                wav, dur = decode_media_to_wav(part.path, wav)
+            else:
+                dur = wav_duration(wav)
+
+            done = job["parts"].get(str(i))
+            if done is not None:
+                self._report_progress(f"{label}: already transcribed earlier — reused")
+                segs = [TranscriptSegment(**d) for d in done.get("segments", [])]
+            else:
+                base = list(all_segments)
+
+                def _partial(segs_so_far, base=base, off=offset):
+                    self._default_partial(
+                        base + [self._shift(x, off) for x in segs_so_far])
+
+                segs = self._transcribe_to_segments(
+                    wav, language=plan.language, prompt=prompt,
+                    job_key=f"{part.path}|{part.size}", on_partial=_partial,
+                    label=label,
+                )
+                if self._transcriber is not None and \
+                        getattr(self._transcriber, "cancel_requested", False):
+                    all_segments.extend(self._shift(x, offset) for x in segs)
+                    self.meeting.transcript = all_segments
+                    self._finish_meeting_audio(source_files, offset)
+                    self._set_state(PipelineState.IDLE)
+                    self._report_progress(
+                        f"Import paused at {label.lower()} — finished parts are "
+                        "kept. Import the same files again to resume.")
+                    return
+                job["parts"][str(i)] = {"duration": dur,
+                                        "segments": [x.to_dict() for x in segs]}
+                safe_write_json(job_path, job)
+
+            all_segments.extend(self._shift(x, offset) for x in segs)
+            source_files.append({
+                "name": part.name, "path": part.path, "duration": round(dur, 2),
+                "offset": round(offset, 2), "recorded_at": part.recorded_at,
+                "gap_before": part.gap_before,
+            })
+            offset += dur
+            self._default_partial(list(all_segments))
+
+        self.meeting.transcript = all_segments
+        self._finish_meeting_audio(source_files, offset)
+
+        if self.settings.get("diarization_enabled") and self.settings.get("hf_token"):
+            self._set_state(PipelineState.DIARIZING)
+            self._report_progress("Identifying speakers...")
+            self._diarize(self.meeting.audio_path)
+
+        if self.settings.get_llm_backend() != LLMBackend.NONE:
+            self._set_state(PipelineState.STRUCTURING)
+            self._structure()
+
+        job["status"] = "transcribed"
+        safe_write_json(job_path, job)
+        self._set_state(PipelineState.IDLE)
+        self._report_progress(
+            f"Transcription complete — {len(all_segments)} segments, "
+            f"{format_duration(offset)}")
+
+    def _finish_meeting_audio(self, source_files: List[dict], total: float) -> None:
+        """Join the decoded parts into one WAV for playback and the bundle."""
+        wavs = [w for w in self._working_audio_paths if os.path.exists(w)]
+        if not wavs:
+            return
+        if len(wavs) == 1:
+            combined = wavs[0]
+        else:
+            self._report_progress("Joining parts into one recording...")
+            combined = os.path.join(str(get_temp_dir()),
+                                    os.path.basename(wavs[0]).replace("_part1", "_combined"))
+            concat_wavs_streaming(wavs, combined)
+            self._working_audio_paths.append(combined)
+        self._working_audio_path = combined
+        self.meeting.audio_path = combined
+        self.meeting.metadata.source_files = source_files
+        total = total or wav_duration(combined)
+        self.meeting.metadata.duration = format_duration(total)
+        self.meeting.metadata.duration_seconds = total
+
+    @staticmethod
+    def pending_import_jobs() -> List[dict]:
+        """Unfinished imports that can be resumed (app restarted mid-import)."""
+        out = []
+        folder = _import_jobs_dir()
+        for name in os.listdir(folder):
+            if not name.startswith("import_") or not name.endswith(".json"):
+                continue
+            path = os.path.join(folder, name)
+            job = safe_read_json(path) or {}
+            if job.get("status") != "running" or "plan" not in job:
+                continue
+            try:
+                plan = ImportPlan.from_dict(job["plan"])
+            except Exception:
+                continue
+            if not all(os.path.exists(p.path) for p in plan.parts):
+                continue  # source files moved/deleted — can't resume
+            out.append({"path": path, "plan": plan,
+                        "done": len(job.get("parts", {})), "total": len(plan.parts)})
+        return out
+
+    @staticmethod
+    def discard_import_job(job_path: str) -> None:
+        try:
+            if job_path and os.path.exists(job_path):
+                os.remove(job_path)
+        except OSError:
+            pass
 
     def _diarize(self, audio_path: str) -> None:
         """Run speaker diarization."""
@@ -512,14 +733,26 @@ class MeetingPipeline:
 
         backend = self.settings.get_llm_backend()
 
+        chars = sum(len(x.text) for x in (self.meeting.transcript or []))
+        if chars > MAX_ANALYSIS_CHARS:
+            self._report_progress(
+                "Analysis panel skipped: the transcript is too long for a single "
+                "AI request. The full transcript is saved for document writing.")
+            return
+        # Groq reuses the transcription key when no separate key is set.
+        api_key = self.settings.get("llm_api_key", "")
+        if backend == LLMBackend.GROQ and not api_key:
+            api_key = self.settings.get("groq_api_key", "")
+
         try:
             self._structurer = MeetingStructurer(
                 backend=backend,
-                model=self.settings.get("llm_model", "llama3.1:8b"),
-                api_key=self.settings.get("llm_api_key", ""),
+                model=self.settings.get("llm_model", ""),
+                api_key=api_key,
                 base_url=self.settings.get("ollama_base_url", "http://localhost:11434"),
             )
 
+            self._report_progress("Extracting action items and decisions...")
             structured = self._structurer.extract_structure(self.meeting.transcript)
             self.meeting.structured = structured
 
@@ -593,6 +826,17 @@ class MeetingPipeline:
 
         meta = self.meeting.metadata
         lines = []
+        parts = meta.source_files if len(meta.source_files or []) > 1 else []
+
+        def part_markers(seg_start, state):
+            """Yield a heading each time the transcript enters the next part."""
+            out = []
+            while state["next"] < len(parts) and \
+                    seg_start >= parts[state["next"]].get("offset", 0) - 0.5:
+                f = parts[state["next"]]
+                state["next"] += 1
+                out.append((state["next"], f))
+            return out
 
         if fmt == "md":
             lines.append(f"# {meta.title}")
@@ -602,24 +846,34 @@ class MeetingPipeline:
             if meta.attendees:
                 lines.append(f"**Speakers:** {', '.join(meta.attendees)}  ")
             lines.append("")
+            lines += context_markdown(meta)
             lines.append("## Transcript")
             lines.append("")
+            state = {"next": 0}
             for seg in self.meeting.transcript:
-                ts = f"{int(seg.start // 60)}:{int(seg.start % 60):02d}"
+                for k, f in part_markers(seg.start, state):
+                    lines.append(f"### Part {k} — `{f.get('name')}` "
+                                 f"(starts at {_ts(f.get('offset', 0))})")
+                    lines.append("")
                 speaker = seg.speaker or "Speaker"
-                lines.append(f"**[{ts}] {speaker}:** {seg.text}")
+                lines.append(f"**[{_ts(seg.start)}] {speaker}:** {seg.text}")
                 lines.append("")
         else:
             lines.append(f"{meta.title}")
             lines.append(f"Date: {meta.date}   Duration: {meta.duration}")
             if meta.attendees:
                 lines.append(f"Speakers: {', '.join(meta.attendees)}")
+            for ln in context_markdown(meta, heading="Meeting context:"):
+                lines.append(ln.replace("**", ""))
             lines.append("=" * 60)
             lines.append("")
+            state = {"next": 0}
             for seg in self.meeting.transcript:
-                ts = f"{int(seg.start // 60)}:{int(seg.start % 60):02d}"
+                for k, f in part_markers(seg.start, state):
+                    lines.append(f"── Part {k}: {f.get('name')} "
+                                 f"(starts at {_ts(f.get('offset', 0))}) ──")
                 speaker = seg.speaker or "Speaker"
-                lines.append(f"[{ts}] {speaker}: {seg.text}")
+                lines.append(f"[{_ts(seg.start)}] {speaker}: {seg.text}")
 
         with open(output_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
@@ -756,7 +1010,8 @@ class MeetingPipeline:
             date=self.meeting.metadata.date,
             duration=self.meeting.metadata.duration,
             duration_seconds=self.meeting.metadata.duration_seconds,
-            speakers=", ".join(self.meeting.metadata.attendees),
+            speakers=", ".join(self.meeting.metadata.attendees
+                               or self.meeting.metadata.participants),
             transcript_text=transcript_text,
             file_size_mb=os.path.getsize(bundle_path) / 1024 / 1024,
         )
@@ -772,15 +1027,22 @@ class MeetingPipeline:
                     session_id = self._capture_engine.session_id
                 freed = cleanup_after_save(
                     session_id=session_id,
-                    audio_paths=[self._working_audio_path, self.meeting.audio_path],
+                    audio_paths=[self._working_audio_path, self.meeting.audio_path]
+                    + list(self._working_audio_paths),
                 )
                 if freed > 1:
                     self._report_progress(
                         f"Bundle saved — freed {freed:.0f} MB of working files"
                     )
                 self._working_audio_path = None
+                self._working_audio_paths = []
             except Exception as e:
                 logger.warning(f"Post-save cleanup skipped: {e}")
+
+        # A saved import no longer needs its resume manifest.
+        if self._current_import_job:
+            self.discard_import_job(self._current_import_job)
+            self._current_import_job = None
 
         self._set_state(PipelineState.IDLE)
         self._report_progress(f"Bundle saved: {bundle_path}")
@@ -801,47 +1063,37 @@ class MeetingPipeline:
         if self._capture_engine is not None:
             session_id = self._capture_engine.session_id
 
-        paths = [self._working_audio_path]
+        paths = [self._working_audio_path] + list(self._working_audio_paths)
         if self.meeting:
             paths.append(self.meeting.audio_path)
 
         freed = cleanup_after_save(session_id=session_id, audio_paths=paths)
         self._working_audio_path = None
+        self._working_audio_paths = []
+        if self._current_import_job:
+            self.discard_import_job(self._current_import_job)
+            self._current_import_job = None
         self.meeting = None
         self._set_state(PipelineState.IDLE)
         logger.info(f"Meeting discarded, freed {freed:.1f} MB")
         return freed
 
-    # Document types offered when saving a bundle.
-    # key -> (label, instruction sent to the AI)
-    DOCUMENT_TYPES = {
-        "mom": (
-            "Minutes of Meeting (MoM)",
-            "A formal Minutes of Meeting document with: title, date, duration, "
-            "attendees, agenda/topics discussed, decisions made (with who made "
-            "them), action items in a table (owner, action, due date), and "
-            "next steps. Use the dominant language of the transcript.",
-        ),
-        "faq": (
-            "FAQ",
-            "A FAQ document: extract the questions raised during the meeting "
-            "and the answers given, phrased as clear Q&A pairs. Group related "
-            "questions under headings. If a question was raised but never "
-            "answered, list it under 'Open Questions'.",
-        ),
-        "summary": (
-            "Summary",
-            "A concise executive summary: 3-5 short paragraphs covering what "
-            "was discussed, what was decided, and what happens next. Add a "
-            "bulleted 'Key Points' list at the end. Keep it under one page.",
-        ),
-    }
+    # Document types offered when saving a bundle (shared with the wizard).
+    # key -> (label, instruction for whoever writes the document)
+    DOCUMENT_TYPES = dict(DOCUMENTS)
 
     def _write_document_request(self, base: str, bundle_path: str,
                                 requested: List[str]) -> str:
-        """Write the .request.md hand-off file next to the bundle."""
+        """Write the .request.md hand-off file next to the bundle.
+
+        It carries everything needed to write the documents later without
+        guessing: the requested documents, the meeting context entered in the
+        Import Wizard (client, engagement, roles, participants, key terms,
+        instructions), and the rules for staying faithful to the transcript.
+        """
         meta = self.meeting.metadata
         transcript_md = os.path.basename(base + ".md")
+        stem = os.path.basename(base)
 
         lines = [
             f"# Document Request — {meta.title}",
@@ -854,29 +1106,38 @@ class MeetingPipeline:
             f"- **Bundle:** `{os.path.basename(bundle_path)}`",
             f"- **Transcript:** `{transcript_md}` (read this — no unzip needed)",
             "",
-            "## Documents requested",
-            "",
         ]
+        lines += context_markdown(meta)
+        lines += ["## Documents requested", ""]
         for key in requested:
-            label, instruction = self.DOCUMENT_TYPES.get(
-                key, (key, f"A document of type: {key}")
-            )
-            lines.append(f"### {label}")
-            lines.append("")
-            lines.append(instruction)
-            lines.append("")
-            lines.append(f"- Output file: `{os.path.basename(base)}_{key}.docx`")
-            lines.append("")
+            if key == "custom":
+                custom = next((ln.split(":", 1)[1].strip() for ln in
+                               (meta.document_instructions or "").splitlines()
+                               if ln.startswith("Custom document requested:")), "")
+                label, instruction = ("Custom document", custom or "As described by the user.")
+            else:
+                label, instruction = self.DOCUMENT_TYPES.get(
+                    key, (key, f"A document of type: {key}"))
+            lines += [f"### {label}", "", instruction, "",
+                      f"- Output file: `{stem}_{key}.docx`", ""]
 
+        lang = meta.document_language
+        lang_rule = ("Write in the dominant language of the transcript."
+                     if not lang or lang == "Same as the meeting"
+                     else f"Write the documents in {lang}.")
         lines += [
             "## Instructions for the AI assistant",
             "",
-            f"1. Read `{transcript_md}` in this folder.",
+            f"1. Read `{transcript_md}` in this folder, including its Meeting context section.",
             "2. Produce each document listed above as a .docx in this same folder.",
             "3. Use only facts present in the transcript — never invent names, "
             "dates or commitments. Write 'Not discussed' where information is "
-            "missing.",
-            "4. When finished, change Status at the top of this file to **DONE**.",
+            "missing, and flag unclear passages for verification instead of guessing.",
+            "4. Use the key terms and participant names above for correct spelling; "
+            "the transcript may contain misheard versions of them.",
+            f"5. {lang_rule}",
+            "6. Cite timestamps (e.g. [1:02:15]) for decisions, action items and open points.",
+            "7. When finished, change Status at the top of this file to **DONE**.",
             "",
         ]
 

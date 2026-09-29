@@ -95,6 +95,7 @@ class GroqTranscriber:
 
     def transcribe_file(self, audio_path: str,
                         on_progress: Optional[Callable[[float], None]] = None,
+                        job_key: Optional[str] = None,
                         **_ignored) -> List[TranscriptSegment]:
         """
         Transcribe an audio file via Groq, chunking as needed.
@@ -131,7 +132,7 @@ class GroqTranscriber:
         # ── Resume support ──
         # Chunk boundaries are deterministic (same audio → same split), so a
         # saved job maps cleanly onto the chunks we just computed.
-        job_path, job = self._load_job(audio_path, len(chunks))
+        job_path, job = self._load_job(audio_path, len(chunks), job_key)
         already_done = len(job["completed"])
         if already_done:
             self._status(
@@ -216,17 +217,22 @@ class GroqTranscriber:
         logger.info(f"Groq transcription complete: {len(all_segments)} segments")
         return all_segments
 
-    def _load_job(self, audio_path: str, n_chunks: int):
+    def _load_job(self, audio_path: str, n_chunks: int, job_key: Optional[str] = None):
         """Load or create the persistent job manifest for this audio file.
         Job identity = file path + size + mtime, so a re-exported file gets
-        a fresh job while the same file resumes."""
+        a fresh job while the same file resumes. Imports pass `job_key`
+        (the ORIGINAL video/audio file's identity) because the decoded WAV
+        is recreated on every run and would otherwise never match."""
         if not self.resume_dir:
             return None, {"completed": {}}
 
         try:
             os.makedirs(self.resume_dir, exist_ok=True)
-            st = os.stat(audio_path)
-            key = f"{audio_path}|{st.st_size}|{int(st.st_mtime)}|{self.model_size}"
+            if job_key:
+                key = f"{job_key}|{self.model_size}|{self.language}"
+            else:
+                st = os.stat(audio_path)
+                key = f"{audio_path}|{st.st_size}|{int(st.st_mtime)}|{self.model_size}"
             job_id = hashlib.md5(key.encode("utf-8")).hexdigest()[:16]
             job_path = os.path.join(self.resume_dir, f"groq_job_{job_id}.json")
 

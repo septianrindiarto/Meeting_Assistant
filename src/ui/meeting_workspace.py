@@ -48,31 +48,100 @@ class ProcessingThread(QThread):
 
 
 class ImportThread(QThread):
-    """Background thread: decode a media file and transcribe it."""
+    """Background thread: transcribe the files confirmed in the Import Wizard
+    (one or several parts) as one meeting."""
     finished = pyqtSignal()
     error = pyqtSignal(str)
     progress = pyqtSignal(str)
 
-    def __init__(self, pipeline: MeetingPipeline, media_path: str):
+    def __init__(self, pipeline: MeetingPipeline, plan):
         super().__init__()
         self.pipeline = pipeline
-        self.media_path = media_path
+        self.plan = plan
 
     def run(self):
         try:
             self.pipeline.on_progress = lambda msg: self.progress.emit(msg)
-            self.pipeline.import_media_file(self.media_path)
-            self.pipeline.process_meeting()
+            self.pipeline.run_import(self.plan)
             self.finished.emit()
         except Exception as e:
+            logger.error(f"Import failed: {e}", exc_info=True)
             self.error.emit(str(e))
+
+
+class WhatsNextDialog(QDialog):
+    """Shown after a meeting is saved: where things are and what to do next."""
+
+    def __init__(self, bundle_path: str, parent=None):
+        super().__init__(parent)
+        from src.core import request_queue
+        self.setWindowTitle("Saved — what's next")
+        self.setMinimumWidth(560)
+        base = os.path.splitext(bundle_path)[0]
+        self.folder = os.path.dirname(bundle_path)
+        self.transcript = base + ".md"
+        request_path = base + ".request.md"
+        self.item = request_queue.parse_request(request_path) \
+            if os.path.exists(request_path) else None
+
+        lay = QVBoxLayout(self)
+        head = QLabel("✓ Meeting saved")
+        head.setFont(QFont("Inter", 14, QFont.Weight.DemiBold))
+        head.setStyleSheet("color: #22c55e;")
+        lay.addWidget(head)
+
+        files = [f"• <b>{os.path.basename(bundle_path)}</b> — audio + transcript + context",
+                 f"• <b>{os.path.basename(self.transcript)}</b> — readable transcript "
+                 "with the meeting context"]
+        if self.item:
+            files.append(f"• <b>{os.path.basename(request_path)}</b> — request for: "
+                         + ", ".join(self.item.documents))
+        info = QLabel("<br>".join(files) + f"<br><br>Folder: {self.folder}")
+        info.setWordWrap(True)
+        info.setTextFormat(Qt.TextFormat.RichText)
+        lay.addWidget(info)
+
+        steps = ["1. Skim the transcript for misheard names or terms.",
+                 ("2. When you're ready, ask Claude to write the documents — "
+                  "click “Copy prompt for Claude” and paste it into Cowork."
+                  if self.item else
+                  "2. No documents were requested — the transcript is ready to use."),
+                 "3. Documents Claude writes as .md can be turned into Word files from "
+                 "Home → Document queue → Convert .md → .docx."]
+        st = QLabel("<br>".join(steps))
+        st.setWordWrap(True)
+        st.setStyleSheet("color: #a0a0b8;")
+        lay.addWidget(st)
+
+        row = QHBoxLayout()
+        b1 = QPushButton("Open folder")
+        b1.clicked.connect(lambda: os.startfile(self.folder))
+        row.addWidget(b1)
+        b2 = QPushButton("Open transcript")
+        b2.clicked.connect(lambda: os.path.exists(self.transcript) and os.startfile(self.transcript))
+        row.addWidget(b2)
+        if self.item:
+            b3 = QPushButton("📋 Copy prompt for Claude")
+            b3.clicked.connect(self._copy_prompt)
+            row.addWidget(b3)
+        row.addStretch()
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        row.addWidget(close)
+        lay.addLayout(row)
+
+    def _copy_prompt(self):
+        from PyQt6.QtWidgets import QApplication
+        from src.core import request_queue
+        QApplication.clipboard().setText(request_queue.claude_prompt(self.item))
+        QMessageBox.information(self, "Copied", "Prompt copied — paste it into Claude (Cowork).")
 
 
 class SaveWithDocumentsDialog(QDialog):
     """Asked on Save Bundle: which documents should be produced from this
     meeting, and whether the app should generate them itself."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, preselected=None, ai_available: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Save Meeting — Documents")
         self.setMinimumWidth(460)
@@ -88,7 +157,7 @@ class SaveWithDocumentsDialog(QDialog):
         self.checks = {}
         for key, (label, _instr) in MeetingPipeline.DOCUMENT_TYPES.items():
             cb = QCheckBox(label)
-            cb.setChecked(key == "mom")  # MoM ticked by default
+            cb.setChecked(key in preselected if preselected else key == "mom")
             layout.addWidget(cb)
             self.checks[key] = cb
 
@@ -97,7 +166,10 @@ class SaveWithDocumentsDialog(QDialog):
         self.generate_check = QCheckBox(
             "Generate them now using the app's AI backend"
         )
-        self.generate_check.setChecked(True)
+        # Off by default: documents are written later (e.g. by Claude) from
+        # the request file. Only enabled when an AI backend is configured.
+        self.generate_check.setChecked(False)
+        self.generate_check.setEnabled(ai_available)
         self.generate_check.setToolTip(
             "Uses the LLM configured in Settings (Groq is free).\n"
             "Untick if you prefer your own AI assistant to write them "
@@ -197,9 +269,10 @@ class TranscriptListItem(QListWidgetItem):
 
     @staticmethod
     def _format_time(seconds: float) -> str:
-        m = int(seconds) // 60
-        s = int(seconds) % 60
-        return f"{m}:{s:02d}"
+        s = int(seconds)
+        if s >= 3600:
+            return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}"
+        return f"{s // 60}:{s % 60:02d}"
 
 
 class MeetingWorkspace(QWidget):
@@ -214,6 +287,8 @@ class MeetingWorkspace(QWidget):
     # Thread-safe bridge: live/processing transcript updates arrive from
     # worker threads; Qt queues this signal onto the main thread.
     transcript_updated = pyqtSignal(list)
+    # Device switches / warnings during recording (from the capture thread).
+    device_event = pyqtSignal(str, str)
 
     def __init__(self, pipeline: MeetingPipeline, parent=None):
         super().__init__(parent)
@@ -310,6 +385,9 @@ class MeetingWorkspace(QWidget):
         # safely onto the main thread before touching widgets.
         self.pipeline.on_transcript_update = self.transcript_updated.emit
         self.transcript_updated.connect(self._on_transcript_update)
+        self.pipeline.on_device_event = self.device_event.emit
+        self.device_event.connect(self._on_device_event)
+        self._segment_rows: List[int] = []   # transcript segment → list row
 
     def _create_transcript_panel(self) -> QFrame:
         """Create the transcript viewer panel with clickable segments."""
@@ -544,10 +622,14 @@ class MeetingWorkspace(QWidget):
             # Past all segments — highlight last
             active_index = len(self._transcript_segments) - 1
 
-        # Highlight active segment
-        for i in range(self.transcript_list.count()):
+        # Highlight active segment (rows may include part headings)
+        rows = self._segment_rows or list(range(self.transcript_list.count()))
+        active_row = rows[active_index] if active_index < len(rows) else -1
+        for i in rows:
             item = self.transcript_list.item(i)
-            if i == active_index:
+            if item is None:
+                continue
+            if i == active_row:
                 item.setBackground(QColor(99, 102, 241, 35))
                 item.setForeground(QColor("#f0f0f8"))
                 # Ensure it's visible
@@ -610,6 +692,13 @@ class MeetingWorkspace(QWidget):
         self.process_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
 
+    def _on_device_event(self, level: str, message: str):
+        """Show device switches / failures while recording."""
+        if self.recording_bar is not None:
+            self.recording_bar.show_event(level, message)
+        if level in ("warning", "error"):
+            self.status_label.setText(message[:90])
+
     def _on_recording_pause(self):
         """Toggle pause/resume."""
         if self.pipeline.state == PipelineState.RECORDING:
@@ -656,18 +745,11 @@ class MeetingWorkspace(QWidget):
 
     # ─── Media Import ────────────────────────────────────────────
 
-    def _on_import_media(self):
-        """Pick an audio/video file and transcribe it automatically.
-        mp4 and mp3 are both decoded directly — no conversion step needed."""
-        filepath, _ = QFileDialog.getOpenFileName(
-            self, "Import Audio / Video",
-            "",
-            "Media Files (*.mp3 *.mp4 *.m4a *.wav *.opus *.ogg *.flac "
-            "*.aac *.mkv *.webm *.mov);;All Files (*)"
-        )
-        if not filepath:
-            return
-
+    def _on_import_media(self, files=None):
+        """Open the Import Wizard (optionally with files already chosen, e.g.
+        dropped on the window) and transcribe what the user confirms."""
+        if not isinstance(files, list):
+            files = None
         if self.pipeline.state != PipelineState.IDLE:
             QMessageBox.warning(
                 self, "Busy",
@@ -675,11 +757,22 @@ class MeetingWorkspace(QWidget):
             )
             return
 
-        # Reset the workspace for the imported meeting
-        self.title_label.setText(os.path.basename(filepath))
+        from src.ui.import_wizard import ImportWizard
+        plan = ImportWizard.run(self, files)
+        if plan is None:
+            return
+        self.start_import_plan(plan)
+
+    def start_import_plan(self, plan):
+        """Run a confirmed (or resumed) import plan in the background."""
+        self._import_plan = plan
+        self.title_label.setText(plan.title or plan.parts[0].name)
         self.transcript_list.clear()
         self.transcript_list.hide()
-        self.transcript_empty.setText("Decoding and transcribing the file...")
+        n = len(plan.parts)
+        self.transcript_empty.setText(
+            f"Reading and transcribing {n} file{'s' if n > 1 else ''}...\n\n"
+            "The transcript appears here as each part finishes.")
         self.transcript_empty.show()
         self._transcript_segments = []
         self.summary_text.clear()
@@ -694,13 +787,14 @@ class MeetingWorkspace(QWidget):
         # Process button doubles as Cancel during import transcription
         self._is_processing = True
         self.process_btn.setText("  ✕ Cancel  ")
-        self.process_btn.setToolTip("Stop transcription — partial transcript is kept")
+        self.process_btn.setToolTip("Stop — finished parts are kept; import the "
+                                    "same files again to resume")
         self.process_btn.setEnabled(True)
         self.save_btn.setEnabled(False)
         self.status_label.setText("Importing...")
         self.progress_bar.show()
 
-        self._import_thread = ImportThread(self.pipeline, filepath)
+        self._import_thread = ImportThread(self.pipeline, plan)
         self._import_thread.progress.connect(self._on_progress_update)
         self._import_thread.finished.connect(self._on_import_done)
         self._import_thread.error.connect(self._on_import_error)
@@ -711,9 +805,33 @@ class MeetingWorkspace(QWidget):
         self.import_btn.setEnabled(True)
         self._reset_process_button()
         self.save_btn.setEnabled(True)
-        self.status_label.setText("Import complete!")
-        if self.pipeline.meeting:
-            self._populate_structured_data(self.pipeline.meeting)
+        meeting = self.pipeline.meeting
+        if meeting:
+            self._populate_structured_data(meeting)
+
+        transcriber = getattr(self.pipeline, "_transcriber", None)
+        if transcriber is not None and getattr(transcriber, "cancel_requested", False):
+            self.status_label.setText("Import paused — finished parts are kept")
+            QMessageBox.information(
+                self, "Import paused",
+                "Transcription was stopped. Every part that finished is kept.\n\n"
+                "To continue later, import the same files again (or accept the "
+                "resume offer when the app starts) — finished parts won't be "
+                "transcribed again.\n\nSaving now would store only the partial "
+                "transcript.")
+            return
+
+        self.status_label.setText("Transcription complete!")
+        plan = getattr(self, "_import_plan", None)
+        if meeting and plan is not None and plan.auto_save:
+            try:
+                path = self.pipeline.save_bundle(
+                    requested_documents=meeting.metadata.requested_documents)
+                self.status_label.setText(f"Saved: {os.path.basename(path)}")
+                self.meeting_saved.emit()
+                WhatsNextDialog(path, self).exec()
+            except Exception as e:
+                QMessageBox.critical(self, "Save failed", f"Could not save the meeting:\n{e}")
 
     def _on_import_error(self, error: str):
         self.progress_bar.hide()
@@ -852,13 +970,26 @@ class MeetingWorkspace(QWidget):
         """Update transcript display when new segments arrive."""
         self._transcript_segments = segments
         self.transcript_list.clear()
+        self._segment_rows = []
 
         if segments:
             self.transcript_empty.hide()
             self.transcript_list.show()
 
+            meeting = self.pipeline.meeting
+            parts = []
+            if meeting and len(meeting.metadata.source_files or []) > 1:
+                parts = meeting.metadata.source_files
+            nxt = 0
             for seg in segments:
+                while nxt < len(parts) and seg.start >= parts[nxt].get("offset", 0) - 0.5:
+                    hdr = QListWidgetItem(f"── Part {nxt + 1}: {parts[nxt].get('name')} ──")
+                    hdr.setFlags(Qt.ItemFlag.NoItemFlags)
+                    hdr.setForeground(QColor("#6366f1"))
+                    self.transcript_list.addItem(hdr)
+                    nxt += 1
                 item = TranscriptListItem(seg)
+                self._segment_rows.append(self.transcript_list.count())
                 self.transcript_list.addItem(item)
         else:
             self.transcript_list.hide()
@@ -1086,11 +1217,20 @@ class MeetingWorkspace(QWidget):
             QMessageBox.warning(self, "No Meeting", "Nothing to save.")
             return
 
-        dlg = SaveWithDocumentsDialog(self)
+        from src.core.models import LLMBackend
+        dlg = SaveWithDocumentsDialog(
+            self,
+            preselected=self.pipeline.meeting.metadata.requested_documents or None,
+            ai_available=self.pipeline.settings.get_llm_backend() != LLMBackend.NONE,
+        )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
         requested = dlg.selected_documents()
+        # Keep a custom document requested in the Import Wizard.
+        if "custom" in (self.pipeline.meeting.metadata.requested_documents or []):
+            requested.append("custom")
+        self.pipeline.meeting.metadata.requested_documents = list(requested)
         generate_now = dlg.generate_in_app()
 
         try:
@@ -1115,19 +1255,4 @@ class MeetingWorkspace(QWidget):
             self._docs_thread.start()
             return
 
-        if requested:
-            QMessageBox.information(
-                self, "Saved — documents requested",
-                f"Bundle saved:\n{os.path.basename(path)}\n\n"
-                f"Also written to the same folder:\n"
-                f"• {os.path.splitext(os.path.basename(path))[0]}.md "
-                "(readable transcript)\n"
-                f"• {os.path.splitext(os.path.basename(path))[0]}.request.md "
-                "(what to produce)\n\n"
-                "Your AI assistant with access to this folder can now create "
-                "the documents. Just say: \"process pending meeting requests\"."
-            )
-        else:
-            QMessageBox.information(
-                self, "Saved", f"Meeting bundle saved:\n{path}"
-            )
+        WhatsNextDialog(path, self).exec()

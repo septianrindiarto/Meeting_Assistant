@@ -242,64 +242,207 @@ def concatenate_chunks(chunk_paths: List[str], output_path: str,
     if not chunk_paths:
         raise ValueError("No chunk paths provided")
 
-    all_audio = []
-    for path in chunk_paths:
-        if os.path.exists(path):
-            audio, sr = load_wav(path)
-            if sr != sample_rate:
-                audio = resample(audio, sr, sample_rate)
-            all_audio.append(audio)
-        else:
-            logger.warning(f"Chunk file not found, skipping: {path}")
-
-    if not all_audio:
+    existing = [p for p in chunk_paths if p and os.path.exists(p)]
+    for p in chunk_paths:
+        if p and not os.path.exists(p):
+            logger.warning(f"Chunk file not found, skipping: {p}")
+    if not existing:
         raise ValueError("No valid audio chunks found")
 
-    combined = np.concatenate(all_audio)
-    return save_wav_chunk(combined, output_path, sample_rate)
+    # Stream from disk instead of loading everything: a 7-hour recording would
+    # otherwise need ~1.6 GB of RAM just to join the pieces.
+    return concat_wavs_streaming(existing, output_path, sample_rate)
 
 
-def convert_to_opus(wav_path: str, opus_path: str, bitrate: int = 48000) -> Optional[str]:
+def concat_wavs_streaming(paths: List[str], output_path: str,
+                          sample_rate: int = 16000,
+                          block_frames: int = 16000 * 30) -> str:
+    """Join 16-bit mono WAV files block by block (constant memory).
+
+    Files with a different sample rate / format are converted in memory
+    one at a time (rare — our own chunks and decoded parts are 16 kHz mono).
     """
-    Convert a WAV file to Opus format for compact bundle storage.
-    Requires ffmpeg to be available on PATH.
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with wave.open(output_path, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(sample_rate)
+        for path in paths:
+            with wave.open(path, "rb") as src:
+                same = (src.getnchannels() == 1 and src.getsampwidth() == 2
+                        and src.getframerate() == sample_rate)
+                if same:
+                    while True:
+                        frames = src.readframes(block_frames)
+                        if not frames:
+                            break
+                        out.writeframes(frames)
+                    continue
+            audio, sr = load_wav(path)
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+            if sr != sample_rate:
+                audio = resample(audio.astype(np.float32), sr, sample_rate)
+            out.writeframes((np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes())
+    return output_path
 
-    Args:
-        wav_path: Input WAV file path.
-        opus_path: Output Opus file path.
-        bitrate: Target bitrate in bps.
 
-    Returns:
-        The opus file path if successful, None if ffmpeg not available.
+def iter_wav_blocks(path: str, block_frames: int = 16000 * 60):
+    """Yield float32 mono blocks from a 16-bit WAV without loading it all."""
+    with wave.open(path, "rb") as wf:
+        ch = wf.getnchannels()
+        while True:
+            raw = wf.readframes(block_frames)
+            if not raw:
+                break
+            a = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            if ch > 1:
+                a = a[: len(a) // ch * ch].reshape(-1, ch).mean(axis=1)
+            yield a
+
+
+def wav_duration(path: str) -> float:
+    with wave.open(path, "rb") as wf:
+        return wf.getnframes() / float(wf.getframerate() or 1)
+
+
+def convert_to_opus(wav_path: str, opus_path: str, bitrate: int = 32000) -> Optional[str]:
+    """
+    Convert a WAV file to Opus for compact bundle storage (~15-25 MB per hour
+    of speech instead of ~115 MB as WAV).
+
+    Tries the ffmpeg command first, then falls back to PyAV (installed with
+    faster-whisper), so compression works even when ffmpeg isn't installed.
+
+    Returns the opus path, or None if both methods fail (the caller then
+    stores WAV instead).
     """
     import subprocess
 
+    os.makedirs(os.path.dirname(opus_path) or ".", exist_ok=True)
     try:
-        os.makedirs(os.path.dirname(opus_path), exist_ok=True)
+        # Long meetings take a while to encode — allow ~2 min per audio hour.
+        timeout = max(120, int(wav_duration(wav_path) / 3600 * 120) + 60)
+    except Exception:
+        timeout = 600
+
+    try:
         result = subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-i", wav_path,
-                "-c:a", "libopus",
-                "-b:a", str(bitrate),
-                opus_path
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120
+            ["ffmpeg", "-y", "-i", wav_path, "-c:a", "libopus",
+             "-b:a", str(bitrate), opus_path],
+            capture_output=True, text=True, timeout=timeout,
         )
-        if result.returncode == 0:
-            logger.info(f"Converted to Opus: {opus_path}")
+        if result.returncode == 0 and os.path.exists(opus_path):
+            logger.info(f"Converted to Opus (ffmpeg): {opus_path}")
             return opus_path
-        else:
-            logger.warning(f"ffmpeg conversion failed: {result.stderr}")
-            return None
+        logger.warning(f"ffmpeg conversion failed: {result.stderr[-300:]}")
     except FileNotFoundError:
-        logger.warning("ffmpeg not found on PATH — skipping Opus conversion, storing WAV instead")
-        return None
+        logger.info("ffmpeg not on PATH — using PyAV for Opus encoding")
     except subprocess.TimeoutExpired:
-        logger.warning("ffmpeg conversion timed out")
+        logger.warning("ffmpeg conversion timed out — trying PyAV")
+
+    return _convert_to_opus_pyav(wav_path, opus_path, bitrate)
+
+
+def _convert_to_opus_pyav(wav_path: str, opus_path: str, bitrate: int) -> Optional[str]:
+    try:
+        import av
+    except ImportError:
+        logger.warning("PyAV not available — storing WAV instead of Opus")
         return None
+    try:
+        with wave.open(wav_path, "rb") as wf:
+            rate = wf.getframerate()
+        # Opus only supports 8/12/16/24/48 kHz; our audio is 16 kHz.
+        out_rate = rate if rate in (8000, 12000, 16000, 24000, 48000) else 48000
+        container = av.open(opus_path, "w", format="ogg")
+        stream = container.add_stream("libopus", rate=out_rate)
+        stream.bit_rate = bitrate
+        try:
+            stream.layout = "mono"
+        except Exception:
+            pass
+        for block in iter_wav_blocks(wav_path, block_frames=rate * 10):
+            if rate != out_rate:
+                block = resample(block, rate, out_rate)
+            pcm = (np.clip(block, -1, 1) * 32767).astype(np.int16).reshape(1, -1)
+            frame = av.AudioFrame.from_ndarray(pcm, format="s16", layout="mono")
+            frame.sample_rate = out_rate
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode(None):
+            container.mux(packet)
+        container.close()
+        logger.info(f"Converted to Opus (PyAV): {opus_path}")
+        return opus_path
+    except Exception as e:
+        logger.warning(f"PyAV Opus encoding failed ({e}) — storing WAV instead")
+        try:
+            if os.path.exists(opus_path):
+                os.remove(opus_path)
+        except OSError:
+            pass
+        return None
+
+
+class LinearResampler:
+    """Streaming linear resampler that keeps its position between blocks.
+
+    The old per-block `resample()` rounded each tiny block's length down,
+    losing a fraction of a sample every ~20 ms — about 3-4 seconds of drift
+    per hour of recording. This version carries the fractional position and
+    the last sample across calls, so the timeline stays exact.
+    """
+
+    def __init__(self, src_rate: int, dst_rate: int):
+        self.src_rate = int(src_rate)
+        self.dst_rate = int(dst_rate)
+        self.ratio = self.src_rate / float(self.dst_rate)
+        self._pos = 0.0          # read position within the next buffer
+        self._tail: Optional[float] = None
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32)
+        if self.src_rate == self.dst_rate:
+            return x
+        if len(x) == 0:
+            return np.zeros(0, dtype=np.float32)
+        buf = x if self._tail is None else np.concatenate(
+            (np.array([self._tail], dtype=np.float32), x))
+        n = len(buf)
+        if n < 2:
+            self._tail = float(buf[-1])
+            return np.zeros(0, dtype=np.float32)
+        t = np.arange(self._pos, n - 1, self.ratio)
+        out = np.interp(t, np.arange(n), buf).astype(np.float32) if len(t) else \
+            np.zeros(0, dtype=np.float32)
+        next_pos = (t[-1] + self.ratio) if len(t) else self._pos
+        # The next buffer starts with this buffer's last sample (index n-1).
+        self._pos = next_pos - (n - 1)
+        self._tail = float(buf[-1])
+        return out
+
+
+def mix_sources(arrays: List[np.ndarray]) -> np.ndarray:
+    """Mix any number of equal-length mono streams.
+
+    Silent sources are ignored (so an idle loopback never halves the mic
+    level); when several carry sound they are summed with gentle
+    attenuation and clipped.
+    """
+    if not arrays:
+        return np.zeros(0, dtype=np.float32)
+    n = max(len(a) for a in arrays)
+    padded = [a if len(a) == n else np.pad(a, (0, n - len(a))) for a in arrays]
+    active = [a for a in padded
+              if len(a) and float(np.sqrt(np.mean(a ** 2))) > SILENCE_RMS_THRESHOLD]
+    if not active:
+        mixed = np.sum(padded, axis=0) if len(padded) > 1 else padded[0]
+    elif len(active) == 1:
+        mixed = active[0]
+    else:
+        mixed = np.sum(active, axis=0) / np.sqrt(len(active))
+    return np.clip(mixed, -1.0, 1.0).astype(np.float32)
 
 
 def get_audio_duration(filepath: str) -> float:

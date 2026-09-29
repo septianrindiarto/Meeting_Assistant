@@ -13,6 +13,7 @@ sounddevice>=0.4.6
 PyAudioWPatch>=0.2.12   # WASAPI loopback support for system audio
 soundfile>=0.12.1       # WAV / FLAC / OGG read+write
 numpy>=1.24.0
+av>=11.0                # PyAV: reads mp4/mp3/... and compresses bundles to Opus
 
 # ── Local transcription ─────────────────────────────────────────────────
 faster-whisper>=1.0.0

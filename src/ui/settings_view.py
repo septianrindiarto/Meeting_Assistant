@@ -12,12 +12,14 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMessageBox, QScrollArea, QFrame, QSpinBox,
     QProgressBar
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 
 from src.core.settings import Settings
 from src.core.models import LLMBackend, AudioSource
-from src.core.audio_capture import AudioCaptureEngine
+from src.core.devices import (
+    DeviceSnapshot, scan_devices, resolve_plan, conflict_warning,
+)
 from src.utils.hardware_probe import get_system_info
 
 logger = logging.getLogger(__name__)
@@ -75,56 +77,93 @@ class SettingsView(QWidget):
         self.audio_source_combo.addItem("Both (microphone + system audio)", "both")
         self.audio_source_combo.addItem("Microphone only", "mic")
         self.audio_source_combo.addItem("System audio only", "system")
+        self.audio_source_combo.currentIndexChanged.connect(lambda _: self._update_plan_preview())
         audio_layout.addRow("Source:", self.audio_source_combo)
 
-        # Microphone device picker
         mic_row = QHBoxLayout()
         self.mic_device_combo = QComboBox()
-        self.mic_device_combo.setMinimumWidth(300)
+        self.mic_device_combo.setMinimumWidth(320)
+        self.mic_device_combo.currentIndexChanged.connect(lambda _: self._update_plan_preview())
         mic_row.addWidget(self.mic_device_combo)
-        refresh_mic_btn = QPushButton("↻")
-        refresh_mic_btn.setToolTip("Re-scan audio devices (plug/unplug detection)")
-        refresh_mic_btn.setFixedWidth(32)
-        refresh_mic_btn.clicked.connect(self._refresh_audio_devices)
-        mic_row.addWidget(refresh_mic_btn)
+        self.refresh_btn = QPushButton("↻")
+        self.refresh_btn.setToolTip("Re-scan audio devices now (they also refresh "
+                                    "automatically every few seconds)")
+        self.refresh_btn.setFixedWidth(32)
+        self.refresh_btn.clicked.connect(self._refresh_audio_devices)
+        mic_row.addWidget(self.refresh_btn)
         audio_layout.addRow("Microphone:", mic_row)
 
-        # System loopback device picker
         self.system_device_combo = QComboBox()
-        self.system_device_combo.setMinimumWidth(300)
+        self.system_device_combo.setMinimumWidth(320)
+        self.system_device_combo.currentIndexChanged.connect(lambda _: self._update_plan_preview())
         audio_layout.addRow("System Audio:", self.system_device_combo)
 
+        self.prefer_bt_check = QCheckBox(
+            "Prefer the first Bluetooth headset connected (also when it connects "
+            "during a recording)")
+        self.prefer_bt_check.toggled.connect(lambda _: self._update_plan_preview())
+        audio_layout.addRow("", self.prefer_bt_check)
+
+        self.bt_mode_combo = QComboBox()
+        self.bt_mode_combo.addItem("Use its microphone AND system audio "
+                                   "(phone-call quality)", "both")
+        self.bt_mode_combo.addItem("Use it for system audio only — keep the "
+                                   "other microphone (better quality)", "system")
+        self.bt_mode_combo.currentIndexChanged.connect(lambda _: self._update_plan_preview())
+        audio_layout.addRow("Bluetooth headset:", self.bt_mode_combo)
+
+        self.plan_label = QLabel("")
+        self.plan_label.setWordWrap(True)
+        self.plan_label.setStyleSheet("color: #6366f1; font-size: 11px;")
+        audio_layout.addRow("Right now:", self.plan_label)
+
+        self.conflict_label = QLabel("")
+        self.conflict_label.setWordWrap(True)
+        self.conflict_label.setStyleSheet("color: #ef4444; font-size: 11px;")
+        self.conflict_label.hide()
+        audio_layout.addRow("", self.conflict_label)
+
         audio_hint = QLabel(
-            "Headsets, Bluetooth earphones, and USB microphones now appear "
-            "in this list (including WASAPI devices). If you just plugged "
-            "in a new device, click ↻ to re-scan.\n\n"
-            "Bluetooth tip: pick the entry with \"Hands-Free\" or \"Headset\" "
-            "in the name for recording. The stereo (A2DP) entry is output-only."
-        )
+            "\"Automatic\" is recommended: the app uses the first Bluetooth headset "
+            "you connect, otherwise the Windows default devices — and switches on "
+            "its own if you connect or disconnect a headset mid-recording. "
+            "Devices are remembered by name, so plugging things in or out "
+            "doesn't change your choice.")
         audio_hint.setStyleSheet("color: #707088; font-size: 11px;")
         audio_hint.setWordWrap(True)
         audio_layout.addRow("", audio_hint)
 
-        # Test-mic row: 3-second level meter to verify the selected device
-        # actually captures audio before committing to a recording.
         test_row = QHBoxLayout()
-        self.test_mic_btn = QPushButton("🎤 Test Microphone (3s)")
+        self.test_mic_btn = QPushButton("🎤 Test audio setup (3 s)")
+        self.test_mic_btn.setToolTip("Records 3 seconds from exactly what a recording "
+                                     "would use — mic AND system audio together.")
         self.test_mic_btn.clicked.connect(self._on_test_mic)
         test_row.addWidget(self.test_mic_btn)
-
+        meters = QVBoxLayout()
         self.test_mic_meter = QProgressBar()
         self.test_mic_meter.setRange(0, 100)
-        self.test_mic_meter.setValue(0)
         self.test_mic_meter.setTextVisible(True)
-        self.test_mic_meter.setFormat("Idle")
-        self.test_mic_meter.setMinimumWidth(220)
-        test_row.addWidget(self.test_mic_meter)
-
+        self.test_mic_meter.setFormat("Mic: idle")
+        self.test_mic_meter.setMinimumWidth(240)
+        self.test_sys_meter = QProgressBar()
+        self.test_sys_meter.setRange(0, 100)
+        self.test_sys_meter.setTextVisible(True)
+        self.test_sys_meter.setFormat("System audio: idle")
+        meters.addWidget(self.test_mic_meter)
+        meters.addWidget(self.test_sys_meter)
+        test_row.addLayout(meters)
         audio_layout.addRow("", test_row)
 
         layout.addWidget(audio_group)
 
-        # Populate device dropdowns
+        # Device lists: scanned in a helper process (sees headsets connected
+        # after the app started) and refreshed automatically while visible.
+        self._snapshot: DeviceSnapshot = DeviceSnapshot()
+        self._scan_thread = None
+        self._device_timer = QTimer(self)
+        self._device_timer.setInterval(5000)
+        self._device_timer.timeout.connect(self._auto_refresh_devices)
+        self._device_timer.start()
         self._refresh_audio_devices()
 
         # ── Transcription Backend ──
@@ -285,19 +324,15 @@ class SettingsView(QWidget):
         )
         llm_layout.addRow("API Key:", self.llm_api_key_input)
 
-        ollama_info = QLabel(
-            "<b style='color:#22c55e;'>groq — FREE.</b> Uses the same key as "
-            "Groq transcription (leave API Key empty). Model: "
-            "<code>llama-3.3-70b-versatile</code>.<br>"
-            "<b>ollama</b> — free &amp; fully local: install "
-            "<a style='color: #6366f1;' href='https://ollama.com'>ollama.com</a>, "
-            "run <code>ollama pull llama3.1:8b</code>.<br>"
-            "<b>openai / anthropic</b> — paid, needs your own API key."
-        )
-        ollama_info.setOpenExternalLinks(True)
-        ollama_info.setStyleSheet("color: #707088; font-size: 11px;")
-        ollama_info.setWordWrap(True)
-        llm_layout.addRow("", ollama_info)
+        self.llm_info = QLabel("")
+        self.llm_info.setOpenExternalLinks(True)
+        self.llm_info.setStyleSheet("color: #707088; font-size: 11px;")
+        self.llm_info.setWordWrap(True)
+        llm_layout.addRow("", self.llm_info)
+        llm_layout.addRow("", QLabel(
+            "<span style='color:#707088;font-size:11px;'>This powers the in-app "
+            "Analysis panel and \u201cAsk AI\u201d button only. Documents written by "
+            "Claude in Cowork don't use this setting.</span>"))
 
         layout.addWidget(llm_group)
 
@@ -389,34 +424,81 @@ class SettingsView(QWidget):
         outer_layout.addWidget(scroll)
 
     def _refresh_audio_devices(self):
-        """Re-scan audio devices and repopulate the dropdowns."""
-        try:
-            devices = AudioCaptureEngine.list_audio_devices()
-        except Exception as e:
-            logger.warning(f"Could not enumerate audio devices: {e}")
-            devices = {'mic_devices': [], 'system_devices': []}
+        """Re-scan devices in the background (helper process → fresh list)."""
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            return
+        self.refresh_btn.setEnabled(False)
+        self._scan_thread = DeviceScanThread()
+        self._scan_thread.done.connect(self._on_devices_scanned)
+        self._scan_thread.start()
 
-        # Microphone dropdown
-        self.mic_device_combo.clear()
-        self.mic_device_combo.addItem("System default", None)
-        for dev in devices['mic_devices']:
-            self.mic_device_combo.addItem(dev['name'], dev['index'])
+    def shutdown(self):
+        """Stop background device scanning (called when the app closes)."""
+        self._device_timer.stop()
+        for t in (self._scan_thread, getattr(self, "_test_thread", None)):
+            if t is not None and t.isRunning():
+                t.wait(3000)
 
-        # System loopback dropdown
-        self.system_device_combo.clear()
-        self.system_device_combo.addItem("Auto-detect (current default output)", None)
-        for dev in devices['system_devices']:
-            self.system_device_combo.addItem(dev['name'], dev['index'])
+    def _auto_refresh_devices(self):
+        if self.isVisible():
+            self._refresh_audio_devices()
 
-        # Restore previously-saved selections (matching by index value)
-        saved_mic = self.settings.get("mic_device_index")
-        saved_sys = self.settings.get("system_device_index")
-        for combo, saved in ((self.mic_device_combo, saved_mic),
-                              (self.system_device_combo, saved_sys)):
-            for i in range(combo.count()):
-                if combo.itemData(i) == saved:
-                    combo.setCurrentIndex(i)
-                    break
+    def _on_devices_scanned(self, snapshot: DeviceSnapshot):
+        self.refresh_btn.setEnabled(True)
+        changed = snapshot.signature() != self._snapshot.signature()
+        self._snapshot = snapshot
+        if changed or self.mic_device_combo.count() == 0:
+            self._fill_device_combos()
+        self._update_plan_preview()
+
+    def _fill_device_combos(self):
+        snap = self._snapshot
+        bt_bases = {g.base for g in snap.bluetooth_groups()}
+
+        def label(dev):
+            tag = "🎧 " if dev.base in bt_bases else ""
+            default = "  (Windows default)" if dev.is_default else ""
+            return f"{tag}{dev.display_name}{default}"
+
+        for combo, devices, auto_text, setting in (
+                (self.mic_device_combo, snap.inputs(),
+                 "Automatic — Bluetooth headset first, then Windows default", "mic_device"),
+                (self.system_device_combo, snap.loopbacks(),
+                 "Automatic — Bluetooth headset first, then Windows default output",
+                 "system_device")):
+            current = combo.currentData() if combo.count() else self.settings.get(setting, "")
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem(auto_text, "")
+            for d in devices:
+                combo.addItem(label(d), d.key)
+            if current and combo.findData(current) < 0:
+                # Keep a saved choice visible even while it's unplugged.
+                name = current.split(":", 1)[-1]
+                combo.addItem(f"⚠ {name}  (not connected — Automatic is used)", current)
+            idx = combo.findData(current or "")
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+
+    def _update_plan_preview(self):
+        snap = self._snapshot
+        if snap.error:
+            self.plan_label.setText(f"⚠ {snap.error}")
+            return
+        if not snap.devices:
+            self.plan_label.setText("Scanning devices…")
+            return
+        mic_pref = self.mic_device_combo.currentData() or None
+        sys_pref = self.system_device_combo.currentData() or None
+        plan = resolve_plan(snap, source=self.audio_source_combo.currentData() or "both",
+                            mic_pref=mic_pref, system_pref=sys_pref,
+                            prefer_bluetooth=self.prefer_bt_check.isChecked(),
+                            bluetooth_mode=self.bt_mode_combo.currentData() or "both")
+        self.plan_label.setText("A recording would use " + plan.describe())
+        self.bt_mode_combo.setEnabled(self.prefer_bt_check.isChecked())
+        warn = conflict_warning(snap, mic_pref, sys_pref)
+        self.conflict_label.setVisible(bool(warn))
+        self.conflict_label.setText(f"⚠ {warn}" if warn else "")
 
     def _load_values(self):
         """Populate UI from saved settings."""
@@ -428,6 +510,14 @@ class SettingsView(QWidget):
             if self.audio_source_combo.itemData(i) == saved_src:
                 self.audio_source_combo.setCurrentIndex(i)
                 break
+        self.prefer_bt_check.setChecked(bool(self.settings.get("prefer_bluetooth", True)))
+        idx = self.bt_mode_combo.findData(self.settings.get("bluetooth_mode", "both"))
+        self.bt_mode_combo.setCurrentIndex(max(0, idx))
+        for combo, key in ((self.mic_device_combo, "mic_device"),
+                           (self.system_device_combo, "system_device")):
+            i = combo.findData(self.settings.get(key, "") or "")
+            if i >= 0:
+                combo.setCurrentIndex(i)
 
         # Transcription backend
         saved_backend = self.settings.get("stt_backend", "local")
@@ -467,7 +557,9 @@ class SettingsView(QWidget):
         self.max_speakers_spin.setValue(self.settings.get("max_speakers", 10))
 
         self.llm_combo.setCurrentText(self.settings.get("llm_backend", "none"))
-        self.llm_model_input.setText(self.settings.get("llm_model", "llama3.1:8b"))
+        self.llm_model_input.setText(
+            valid_model(self.llm_combo.currentText(), self.settings.get("llm_model", "")))
+        self._on_llm_changed(self.llm_combo.currentText())
         self.llm_api_key_input.setText(self.settings.get("llm_api_key", ""))
         self.cloud_check.setChecked(self.settings.get("allow_cloud_llm", False))
 
@@ -479,19 +571,31 @@ class SettingsView(QWidget):
             self.settings.get("temp_retention_hours", 24))
 
     def _on_llm_changed(self, text):
-        """Toggle API key field based on backend selection.
-        Groq is enabled too (optional separate key) — if left empty it
-        falls back to the Groq transcription key."""
-        self.llm_api_key_input.setEnabled(text in ("openai", "anthropic", "groq"))
-        # Helpful default model per backend
-        defaults = {
-            "groq": "llama-3.3-70b-versatile",
-            "ollama": "llama3.1:8b",
-            "openai": "gpt-4o-mini",
-            "anthropic": "claude-sonnet-4-20250514",
-        }
-        if text in defaults and not self.llm_model_input.text().strip():
-            self.llm_model_input.setText(defaults[text])
+        """Keep Model / API key / hint consistent with the chosen backend."""
+        text = text or "none"
+        self.llm_model_input.setEnabled(text != "none")
+        self.llm_api_key_input.setEnabled(text in ("groq", "openai", "anthropic"))
+        self.llm_api_key_input.setPlaceholderText({
+            "groq": "Optional — leave empty to reuse your Groq transcription key",
+            "openai": "Required — your paid OpenAI API key",
+            "anthropic": "Required — paid Anthropic API key (not your Claude subscription)",
+        }.get(text, "Not needed for this backend"))
+        self.llm_model_input.setText(valid_model(text, self.llm_model_input.text()))
+        self.llm_info.setText({
+            "none": "No in-app AI. The Analysis panel stays empty; transcripts and "
+                    "request files for Claude are still created.",
+            "groq": "<b style='color:#22c55e;'>FREE</b> (Groq free tier). Uses your Groq "
+                    "transcription key when the field above is empty. Recommended model: "
+                    "<code>llama-3.3-70b-versatile</code>. Drafts — verify before sharing.",
+            "ollama": "Free &amp; fully local: install <a style='color:#6366f1;' "
+                      "href='https://ollama.com'>ollama.com</a>, then run "
+                      "<code>ollama pull llama3.1:8b</code>.",
+            "openai": "<b style='color:#f59e0b;'>PAID</b> — billed per use to your "
+                      "OpenAI API account.",
+            "anthropic": "<b style='color:#f59e0b;'>PAID</b> — billed per use to an "
+                         "Anthropic API account. A Claude Pro/Max subscription does "
+                         "<b>not</b> include API access.",
+        }.get(text, ""))
 
     def _on_backend_changed(self, _index):
         """Enable Groq fields only when the Groq backend is selected."""
@@ -515,8 +619,10 @@ class SettingsView(QWidget):
 
         # Audio
         self.settings.set("audio_source", self.audio_source_combo.currentData())
-        self.settings.set("mic_device_index", self.mic_device_combo.currentData())
-        self.settings.set("system_device_index", self.system_device_combo.currentData())
+        self.settings.set("mic_device", self.mic_device_combo.currentData() or "")
+        self.settings.set("system_device", self.system_device_combo.currentData() or "")
+        self.settings.set("prefer_bluetooth", self.prefer_bt_check.isChecked())
+        self.settings.set("bluetooth_mode", self.bt_mode_combo.currentData() or "both")
 
         self.settings.set("stt_backend", self.stt_backend_combo.currentData())
         self.settings.set("groq_api_key", self.groq_key_input.text().strip())
@@ -536,7 +642,8 @@ class SettingsView(QWidget):
         self.settings.set("max_speakers", self.max_speakers_spin.value())
 
         self.settings.set("llm_backend", self.llm_combo.currentText())
-        self.settings.set("llm_model", self.llm_model_input.text())
+        self.settings.set("llm_model", valid_model(self.llm_combo.currentText(),
+                                                   self.llm_model_input.text()))
         self.settings.set("llm_api_key", self.llm_api_key_input.text())
         self.settings.set("allow_cloud_llm", self.cloud_check.isChecked())
 
@@ -607,103 +714,156 @@ class SettingsView(QWidget):
     # ─── Microphone test ─────────────────────────────────────────────
 
     def _on_test_mic(self):
-        """Record 3 seconds from the selected mic and show the live RMS level.
-
-        This lets the user verify a Bluetooth / USB headset actually picks up
-        audio BEFORE they commit to a recording. If the bar never moves, the
-        device is wrong (often the A2DP profile instead of HFP).
-        """
-        device_index = self.mic_device_combo.currentData()
-        device_label = self.mic_device_combo.currentText()
-
-        if hasattr(self, "_test_thread") and self._test_thread is not None \
-                and self._test_thread.isRunning():
-            return  # already testing
-
+        """Record 3 s from exactly the devices a recording would use."""
+        if getattr(self, "_test_thread", None) is not None and self._test_thread.isRunning():
+            return
         self.test_mic_btn.setEnabled(False)
-        self.test_mic_meter.setFormat(f"Testing {device_label}...")
         self.test_mic_meter.setValue(0)
-
-        self._test_thread = MicTestThread(device_index, duration=3.0)
+        self.test_sys_meter.setValue(0)
+        self.test_mic_meter.setFormat("Mic: testing…")
+        self.test_sys_meter.setFormat("System audio: testing — play some sound…")
+        self._test_thread = AudioTestThread(
+            source=self.audio_source_combo.currentData() or "both",
+            mic_pref=self.mic_device_combo.currentData() or None,
+            sys_pref=self.system_device_combo.currentData() or None,
+            prefer_bluetooth=self.prefer_bt_check.isChecked(),
+            bluetooth_mode=self.bt_mode_combo.currentData() or "both",
+        )
         self._test_thread.level.connect(self._on_test_level)
         self._test_thread.done.connect(self._on_test_done)
         self._test_thread.failed.connect(self._on_test_failed)
         self._test_thread.start()
 
-    def _on_test_level(self, level: float):
-        # level is RMS 0.0 – 1.0
-        self.test_mic_meter.setValue(min(100, int(level * 100 * 4)))
+    def _on_test_level(self, role: str, level: float):
+        bar = self.test_mic_meter if role == "mic" else self.test_sys_meter
+        bar.setValue(min(100, int(level * 400)))
 
-    def _on_test_done(self, peak: float):
+    def _on_test_done(self, result: dict):
         self.test_mic_btn.setEnabled(True)
-        if peak < 0.01:
-            self.test_mic_meter.setFormat("⚠ No audio detected — wrong device?")
-        elif peak < 0.05:
-            self.test_mic_meter.setFormat(f"Quiet (peak {peak:.2f}) — speak louder")
+        mic = result.get("mic")
+        if mic is None:
+            self.test_mic_meter.setFormat("Mic: not used")
+        elif mic["peak"] < 0.01:
+            self.test_mic_meter.setFormat(f"⚠ Mic: no sound — {mic['device'][:30]}")
+        elif mic["peak"] < 0.05:
+            self.test_mic_meter.setFormat(f"Mic quiet — speak up ({mic['device'][:28]})")
         else:
-            self.test_mic_meter.setFormat(f"✓ OK (peak {peak:.2f})")
+            self.test_mic_meter.setFormat(f"✓ Mic OK — {mic['device'][:34]}")
+        sys_ = result.get("system")
+        if sys_ is None:
+            self.test_sys_meter.setFormat("System audio: not used")
+        elif sys_["peak"] < 0.005:
+            self.test_sys_meter.setFormat("System audio: nothing heard — play a video "
+                                          "and test again")
+        else:
+            self.test_sys_meter.setFormat(f"✓ System audio OK — {sys_['device'][:28]}")
 
     def _on_test_failed(self, message: str):
         self.test_mic_btn.setEnabled(True)
         self.test_mic_meter.setValue(0)
-        self.test_mic_meter.setFormat(f"✗ {message[:60]}")
+        self.test_mic_meter.setFormat(f"✗ {message[:70]}")
+        self.test_sys_meter.setFormat("")
 
 
-class MicTestThread(QThread):
-    """Runs a short live capture so the Settings page can show a level meter.
+_MODEL_DEFAULTS = {
+    "groq": "llama-3.3-70b-versatile",
+    "ollama": "llama3.1:8b",
+    "openai": "gpt-4o-mini",
+    "anthropic": "claude-sonnet-4-20250514",
+}
 
-    Emits `level` ~10x per second while recording, then `done(peak)` when the
-    duration elapses, or `failed(message)` if the device can't be opened.
-    """
-    level = pyqtSignal(float)
-    done = pyqtSignal(float)
+
+def valid_model(backend: str, model: str) -> str:
+    """Replace a model name that belongs to another backend with a sensible
+    default (e.g. 'llama3.1:8b' is an Ollama name — Groq would reject it)."""
+    model = (model or "").strip()
+    if backend not in _MODEL_DEFAULTS:
+        return model
+    ok = {
+        "groq": bool(model) and ":" not in model and "claude" not in model
+                and not model.startswith("gpt"),
+        "ollama": bool(model),
+        "openai": model.startswith(("gpt", "o1", "o3", "o4")),
+        "anthropic": model.startswith("claude"),
+    }[backend]
+    return model if ok else _MODEL_DEFAULTS[backend]
+
+
+class DeviceScanThread(QThread):
+    """Scan audio devices in a helper process without freezing the UI."""
+    done = pyqtSignal(object)
+
+    def run(self):
+        try:
+            snap = scan_devices()
+        except Exception as e:
+            snap = DeviceSnapshot(error=f"Device scan failed: {e}")
+        self.done.emit(snap)
+
+
+class AudioTestThread(QThread):
+    """Open exactly the devices a recording would use for 3 seconds and
+    report the level of the mic and of the system audio separately."""
+    level = pyqtSignal(str, float)
+    done = pyqtSignal(dict)
     failed = pyqtSignal(str)
 
-    def __init__(self, device_index, duration: float = 3.0):
+    def __init__(self, source, mic_pref, sys_pref, prefer_bluetooth, bluetooth_mode,
+                 duration: float = 3.0):
         super().__init__()
-        self.device_index = device_index
+        self.args = dict(source=source, mic_pref=mic_pref, system_pref=sys_pref,
+                         prefer_bluetooth=prefer_bluetooth, bluetooth_mode=bluetooth_mode)
         self.duration = duration
 
     def run(self):
         import time
         import numpy as np
         try:
-            import sounddevice as sd
-
-            if self.device_index is not None:
-                dev_info = sd.query_devices(self.device_index, 'input')
-            else:
-                dev_info = sd.query_devices(kind='input')
-
-            if dev_info.get('max_input_channels', 0) <= 0:
-                self.failed.emit(
-                    "Selected device has no input channels. "
-                    "For Bluetooth, pick the Hands-Free/Headset entry."
-                )
+            import pyaudiowpatch as pa
+        except ImportError:
+            self.failed.emit("PyAudioWPatch is not installed")
+            return
+        from src.core.devices import scan_with
+        p = pa.PyAudio()
+        streams, peaks, devices = [], {}, {}
+        try:
+            plan = resolve_plan(scan_with(p), **self.args)
+            wanted = ([("mic", plan.mic)] if plan.mic else []) + \
+                     [("system", d) for d in plan.loopbacks]
+            if not wanted:
+                self.failed.emit("No audio devices found")
                 return
+            for role, dev in wanted:
+                peaks.setdefault(role, 0.0)
+                devices.setdefault(role, dev.display_name)
 
-            sr = int(dev_info['default_samplerate'])
-            channels = min(dev_info['max_input_channels'], 2)
-            peak = 0.0
-            t_end = time.time() + self.duration
+                def cb(data, frames, t, status, role=role, ch=max(1, dev.channels)):
+                    a = np.frombuffer(data, dtype=np.float32)
+                    if len(a):
+                        rms = float(np.sqrt(np.mean(a ** 2)))
+                        peaks[role] = max(peaks[role], rms)
+                        self.level.emit(role, rms)
+                    return (None, 0)
 
-            def cb(indata, frames, time_info, status):
-                nonlocal peak
-                audio = indata.astype(np.float32).flatten() if channels == 1 \
-                    else indata.astype(np.float32).mean(axis=1)
-                if len(audio):
-                    rms = float(np.sqrt(np.mean(audio ** 2)))
-                    self.level.emit(rms)
-                    if rms > peak:
-                        peak = rms
-
-            with sd.InputStream(device=self.device_index, samplerate=sr,
-                                channels=channels, dtype='float32',
-                                blocksize=1024, callback=cb):
-                while time.time() < t_end:
-                    time.sleep(0.05)
-
-            self.done.emit(peak)
-
+                s = p.open(format=pa.paFloat32, channels=max(1, dev.channels),
+                           rate=int(dev.sample_rate), input=True,
+                           input_device_index=dev.index, frames_per_buffer=1024,
+                           stream_callback=cb)
+                s.start_stream()
+                streams.append(s)
+            time.sleep(self.duration)
+            self.done.emit({role: {"peak": peaks[role], "device": devices[role]}
+                            for role in peaks})
         except Exception as e:
             self.failed.emit(str(e))
+        finally:
+            for s in streams:
+                try:
+                    s.stop_stream()
+                    s.close()
+                except Exception:
+                    pass
+            try:
+                p.terminate()
+            except Exception:
+                pass

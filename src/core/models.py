@@ -145,6 +145,30 @@ class MeetingMetadata:
     app_version: str = "1.0.0"
     template_used: str = ""
 
+    # ── Meeting context (filled by the Import Wizard) ──
+    # Stored in meta.json, the transcript .md and the request file, so an AI
+    # assistant writing documents later knows who/what/why without guessing.
+    client: str = ""                 # organisation the meeting is with / for
+    engagement: str = ""             # project / tender / engagement name
+    meeting_type: str = ""           # e.g. "Vendor briefing / Aanwijzing"
+    our_role: str = ""               # e.g. "We are the vendor"
+    topic: str = ""                  # purpose / agenda, free text
+    participants: List[str] = field(default_factory=list)  # "Name — role/org"
+    key_terms: List[str] = field(default_factory=list)     # names, products, acronyms
+    language: str = ""               # transcription language code ("" = auto)
+    document_language: str = ""      # language for generated documents
+    document_instructions: str = ""  # free-text instructions for the documents
+    requested_documents: List[str] = field(default_factory=list)
+    # Multi-part imports: [{name, duration, offset, recorded_at, gap_before}]
+    source_files: List[dict] = field(default_factory=list)
+    # Device switches / warnings during recording: [{at, level, message}]
+    recording_events: List[dict] = field(default_factory=list)
+
+    def has_context(self) -> bool:
+        return any([self.client, self.engagement, self.meeting_type, self.our_role,
+                    self.topic, self.participants, self.key_terms,
+                    self.document_instructions])
+
     def to_dict(self) -> dict:
         return asdict(self)
 

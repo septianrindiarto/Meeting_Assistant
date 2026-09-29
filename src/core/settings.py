@@ -24,8 +24,15 @@ DEFAULTS = {
 
     # Audio
     "audio_source": "both",  # mic, system, both
-    "mic_device_index": None,
-    "system_device_index": None,
+    # Devices are remembered by NAME ("input:Headset (...)"), never by index —
+    # Windows renumbers devices whenever one is plugged in or removed.
+    # "" = Automatic (first Bluetooth headset connected, else Windows default).
+    "mic_device": "",
+    "system_device": "",
+    "prefer_bluetooth": True,       # use the first Bluetooth headset connected
+    "bluetooth_mode": "both",       # both = mic + system audio, system = system audio only
+    "mic_device_index": None,       # legacy (ignored)
+    "system_device_index": None,    # legacy (ignored)
 
     # Transcription
     "whisper_model": "auto",  # auto, tiny, base, small, medium, large-v3
@@ -51,13 +58,18 @@ DEFAULTS = {
     "max_speakers": 10,
 
     # LLM
-    "llm_backend": "none",  # none, ollama, openai, anthropic
-    "llm_model": "llama3.1:8b",
+    "llm_backend": "none",  # none, groq, ollama, openai, anthropic
+    "llm_model": "llama-3.3-70b-versatile",
     "llm_api_key": "",
     "ollama_base_url": "http://localhost:11434",
 
     # Privacy
     "allow_cloud_llm": False,
+
+    # Import Wizard
+    "auto_save_after_import": True,
+    "recent_clients": [],           # suggestions in the wizard
+    "recent_engagements": [],
 
     # Storage housekeeping
     "auto_cleanup_temp": True,      # purge orphaned temp files on startup
@@ -151,6 +163,14 @@ class Settings:
             logger.debug(f"Settings loaded from {self._path}")
         else:
             logger.info("No existing settings found, using defaults")
+
+    def remember_recent(self, key: str, value: str, limit: int = 15) -> None:
+        """Keep a most-recent-first list of values (e.g. client names)."""
+        value = (value or "").strip()
+        if not value:
+            return
+        items = [v for v in (self.get(key) or []) if v.lower() != value.lower()]
+        self.set(key, [value] + items[: limit - 1])
 
     def to_dict(self) -> dict:
         """Return all settings as a dictionary."""

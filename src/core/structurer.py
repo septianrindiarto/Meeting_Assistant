@@ -54,6 +54,14 @@ USER_PROMPT_TEMPLATE = """Here is the meeting transcript to analyze:
 Extract the structured meeting data as JSON."""
 
 
+def _groq_model(model: Optional[str]) -> str:
+    """Ollama-style names like 'llama3.1:8b' are invalid on Groq."""
+    m = (model or "").strip()
+    if not m or ":" in m or m.startswith(("gpt", "claude")):
+        return "llama-3.3-70b-versatile"
+    return m
+
+
 class MeetingStructurer:
     """
     Extracts structured data from meeting transcripts using an LLM.
@@ -232,7 +240,7 @@ class MeetingStructurer:
         import json as json_module
 
         payload = json_module.dumps({
-            "model": self.model or "llama-3.3-70b-versatile",
+            "model": _groq_model(self.model),
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": USER_PROMPT_TEMPLATE.format(
@@ -335,7 +343,7 @@ class MeetingStructurer:
             return self._chat_openai_compatible(
                 system, user,
                 url="https://api.groq.com/openai/v1/chat/completions",
-                model=self.model or "llama-3.3-70b-versatile",
+                model=_groq_model(self.model),
             )
         if self.backend == LLMBackend.OPENAI:
             return self._chat_openai_compatible(

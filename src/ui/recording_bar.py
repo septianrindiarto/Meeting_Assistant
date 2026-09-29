@@ -6,6 +6,7 @@ Displays: REC indicator, waveform, elapsed time, pause/stop controls.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 from PyQt6.QtWidgets import (
@@ -113,6 +114,11 @@ class RecordingBar(QWidget):
         # For dragging
         self._drag_pos: Optional[QPoint] = None
 
+        # Latest device event (switch / failure) shown for a few seconds
+        self._event_text = ""
+        self._event_color = "#8b8ba0"
+        self._event_until = 0.0
+
         self._setup_ui()
         self._setup_timer()
 
@@ -199,6 +205,14 @@ class RecordingBar(QWidget):
             x = (geo.width() - self.width()) // 2
             self.move(x, 20)
 
+    def show_event(self, level: str, message: str):
+        """Display a device switch / warning on the bar's bottom line."""
+        self._event_text = ("⚠ " if level != "info" else "🔄 ") + message
+        self._event_color = {"info": "#60a5fa", "warning": "#f59e0b",
+                             "error": "#ef4444"}.get(level, "#8b8ba0")
+        self._event_until = time.monotonic() + (8 if level == "info" else 20)
+        self.device_label.setToolTip(message)
+
     def stop(self):
         """Hide the bar and stop updating."""
         self.update_timer.stop()
@@ -212,23 +226,38 @@ class RecordingBar(QWidget):
         seconds = int(elapsed % 60)
         self.elapsed_label.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
 
-        # Show which mic is actually being used, or surface a failure reason.
-        engine = getattr(self.pipeline, "_capture_engine", None)
-        if engine is not None:
-            err = getattr(engine, "mic_start_error", None)
-            if err:
-                self.device_label.setText(f"⚠ Mic FAILED — {err[:80]}")
-                self.device_label.setStyleSheet("color: #ef4444; font-size: 10px;")
-            else:
-                name = getattr(engine, "active_mic_device", None)
+        # Bottom line: a recent device event, or which devices are live.
+        if time.monotonic() < self._event_until:
+            self.device_label.setText(self._event_text[:110])
+            self.device_label.setStyleSheet(
+                f"color: {self._event_color}; font-size: 10px;")
+        else:
+            engine = getattr(self.pipeline, "_capture_engine", None)
+            if engine is not None:
+                err = getattr(engine, "mic_start_error", None)
+                streams = engine.stream_status() if hasattr(engine, "stream_status") else []
+                mic = next((x for x in streams if x["role"] == "mic"), None)
+                outs = [x for x in streams if x["role"] == "system"]
                 verdict, color = self.waveform.quality_verdict()
-                if name:
-                    self.device_label.setText(
-                        f"🎙 {name}  ·  {verdict}"
-                    )
-                    self.device_label.setStyleSheet(
-                        f"color: {color}; font-size: 10px;"
-                    )
+                if err and mic is None:
+                    self.device_label.setText(f"⚠ Mic FAILED — {err[:80]}")
+                    self.device_label.setStyleSheet("color: #ef4444; font-size: 10px;")
+                elif mic and mic["state"] == "stalled":
+                    self.device_label.setText(f"⚠ {mic['device'][:40]} stopped sending "
+                                              "audio — reconnecting...")
+                    self.device_label.setStyleSheet("color: #ef4444; font-size: 10px;")
+                else:
+                    bits = []
+                    if mic:
+                        bits.append(f"🎙 {mic['device'][:38]}")
+                    if outs:
+                        live = sum(1 for o in outs if o["state"] == "ok")
+                        name = outs[0]["device"][:30]
+                        bits.append(f"🔊 {name}" + (f" +{len(outs) - 1}" if len(outs) > 1 else "")
+                                    + ("" if live else " (nothing playing)"))
+                    bits.append(verdict)
+                    self.device_label.setText("  ·  ".join(bits))
+                    self.device_label.setStyleSheet(f"color: {color}; font-size: 10px;")
 
         # Pulse the REC indicator
         if self.pipeline.state == PipelineState.PAUSED:

@@ -91,6 +91,11 @@ class BundleManager:
             audio_file = opus_result or combined_wav
         elif meeting.audio_path and os.path.exists(meeting.audio_path):
             audio_file = meeting.audio_path
+            # Imported media is decoded to WAV (~115 MB per hour) — compress it
+            # like recordings are, instead of storing raw WAV in the bundle.
+            if meeting.audio_path.lower().endswith(".wav"):
+                opus_file = os.path.join(str(get_temp_dir()), "audio.opus")
+                audio_file = convert_to_opus(meeting.audio_path, opus_file) or meeting.audio_path
 
         # Build the ZIP
         with zipfile.ZipFile(bundle_path, 'w', zipfile.ZIP_DEFLATED) as zf:

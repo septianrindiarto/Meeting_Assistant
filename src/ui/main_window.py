@@ -58,6 +58,11 @@ class MainWindow(QMainWindow):
         self._setup_status_bar()
         self._connect_signals()
 
+        # Drop audio/video files anywhere on the window to import them.
+        self.setAcceptDrops(True)
+        # Offer to resume an import that was interrupted (app closed / crash).
+        QTimer.singleShot(1200, self._offer_resume_imports)
+
     def _setup_ui(self):
         """Build the main layout: sidebar + content area."""
         central = QWidget()
@@ -224,6 +229,7 @@ class MainWindow(QMainWindow):
         # Connect home view signals
         self.home_view.meeting_selected.connect(self._on_meeting_selected)
         self.home_view.new_meeting_requested.connect(self._on_new_meeting)
+        self.home_view.import_requested.connect(self._on_import_media)
 
         # Connect meeting workspace signals
         self.meeting_workspace.meeting_saved.connect(self._on_meeting_saved)
@@ -241,10 +247,59 @@ class MainWindow(QMainWindow):
         self._switch_view(1)  # Switch to meeting workspace
         self.meeting_workspace.start_new_meeting()
 
-    def _on_import_media(self):
-        """Import an audio/video file for transcription."""
+    def _on_import_media(self, files=None):
+        """Open the Import Wizard (optionally with files already chosen)."""
         self._switch_view(1)
-        self.meeting_workspace._on_import_media()
+        self.meeting_workspace._on_import_media(files if isinstance(files, list) else None)
+
+    # ── Drag & drop ──
+    def _dropped_paths(self, event):
+        from src.core.media_import import SUPPORTED_EXTENSIONS
+        paths = []
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                p = url.toLocalFile()
+                ext = os.path.splitext(p)[1].lower()
+                if p and (ext in SUPPORTED_EXTENSIONS or ext == ".mscribe"):
+                    paths.append(p)
+        return paths
+
+    def dragEnterEvent(self, event):
+        if self._dropped_paths(event):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        paths = self._dropped_paths(event)
+        bundles = [p for p in paths if p.lower().endswith(".mscribe")]
+        media = [p for p in paths if not p.lower().endswith(".mscribe")]
+        if bundles:
+            self._on_meeting_selected(bundles[0])
+        elif media:
+            self._on_import_media(media)
+
+    # ── Resume interrupted imports ──
+    def _offer_resume_imports(self):
+        try:
+            jobs = self.pipeline.pending_import_jobs()
+        except Exception as e:
+            logger.warning(f"Could not check unfinished imports: {e}")
+            return
+        for job in jobs[:1]:
+            plan = job["plan"]
+            box = QMessageBox(self)
+            box.setWindowTitle("Unfinished import")
+            box.setText(f"The import of “{plan.title}” was interrupted.\n\n"
+                        f"{job['done']} of {job['total']} part(s) are already "
+                        "transcribed and won't be repeated.")
+            resume = box.addButton("Resume now", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+            discard = box.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
+            box.exec()
+            if box.clickedButton() is resume:
+                self._switch_view(1)
+                self.meeting_workspace.start_import_plan(plan)
+            elif box.clickedButton() is discard:
+                self.pipeline.discard_import_job(job["path"])
 
     def _on_open_bundle(self):
         """Open an existing .mscribe bundle."""
@@ -305,7 +360,11 @@ class MainWindow(QMainWindow):
             self.stats_label.setText("No meetings yet")
 
     def closeEvent(self, event):
-        """Save window geometry on close."""
+        """Save window geometry and stop background work on close."""
+        try:
+            self.settings_view.shutdown()
+        except Exception:
+            pass
         self.settings.set("window_geometry", self.saveGeometry().toHex().data().decode())
         self.settings.save()
         super().closeEvent(event)

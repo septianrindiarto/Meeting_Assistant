@@ -39,7 +39,7 @@ python -m venv venv
 .\venv\Scripts\Activate.ps1
 
 # Install dependencies (first time only, ~5-10 minutes)
-pip install -r requirements.txt
+pip install -r gitignore\requirements.txt
 
 # Optional but recommended: pre-download the Whisper model for offline use
 python scripts\download_models.py
@@ -47,6 +47,10 @@ python scripts\download_models.py
 
 > If `Activate.ps1` is blocked, run this once, then retry:
 > `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`
+
+> Downloaded the project from GitHub as a ZIP? Windows extracts it as
+> `Meeting_Assistant-main\Meeting_Assistant-main\…` — `cd` into the **inner**
+> folder (the one containing `main.py`) before running the commands.
 
 ### Start the app
 
@@ -64,9 +68,16 @@ The Meeting Scribe window opens. That's the whole app — everything below happe
 
 Open **Settings** (left sidebar) and check three things:
 
-1. **Audio** — pick your microphone from the dropdown. Using a Bluetooth headset? Choose the entry containing **"Hands-Free"** or **"Headset"** (the plain stereo entry is output-only and cannot record). Click **🎤 Test Microphone (3s)** and speak — the meter should move and show "✓ OK". If it shows "No audio detected", pick a different device and test again.
+1. **Audio** — leave **Microphone** and **System Audio** on **Automatic** (recommended). The app then:
+   - uses the **first Bluetooth headset you connect** (🎧 in the lists), otherwise the Windows default devices;
+   - notices devices you connect **after** the app started — the lists refresh by themselves every few seconds (↻ forces a re-scan);
+   - remembers devices **by name**, so plugging things in or out never changes your choice.
 
-2. **Transcription** — set **Language** if your meetings are mostly one language: `ms` (Bahasa Malaysia), `id` (Indonesian), `en` (English). Leave empty for auto-detect. Leave Quality on **Balanced** and Override Model on **auto** to start.
+   Choose what a Bluetooth headset is used for: **microphone + system audio** (phone-call quality) or **system audio only** (keeps your laptop/USB mic — better quality). The line **"Right now: A recording would use …"** shows exactly which devices a recording will use. If you pick a combination that would record silence, a red warning explains why.
+
+   Click **🎤 Test audio setup (3 s)** — it records from exactly those devices and shows a separate meter for the **mic** and for **system audio** (play a video while testing to check system audio).
+
+2. **Transcription** — Quality **Balanced** and Override Model **auto** are good defaults. The spoken language is chosen **per meeting** in the Import Wizard; the Language field here is only the default for live recordings.
 
 3. **Transcription Backend** — choose where transcription runs:
    - **Local (Whisper)** — default. Private, works offline, slower for long recordings.
@@ -79,60 +90,55 @@ Click **💾 Save Settings**.
 ## 4. Recording a meeting
 
 1. Click **Home → 🎙️ New Meeting**, give it a title.
-2. A small **recording bar** appears (always on top — drag it anywhere, e.g. a second monitor). It shows:
-   - a live waveform and elapsed time
-   - **which microphone is actually in use** and a live quality verdict: 🟢 *Good level* / 🟡 *Quiet — move closer* / 🔴 *Silent — mic not picking up*
-3. Speak normally. **The transcript appears in the app in real time** as you talk (a few seconds behind — this is a fast draft).
-4. Use **⏸️** to pause/resume, **⏹️** to stop.
-5. After stopping, click **Process**. This re-transcribes everything with the higher-quality model, adds speaker labels (if enabled), and extracts the summary / action items / decisions (if an AI backend is configured). A progress % and time estimate is shown; click **✕ Cancel** anytime — partial results are kept.
-6. Click **Save Bundle**. The meeting is saved and appears on the Home screen.
+2. A small **recording bar** appears (always on top — drag it anywhere). Its bottom line shows the **mic** and **system audio** in use plus a live verdict: 🟢 *Good level* / 🟡 *Quiet* / 🔴 *Silent*. "(nothing playing)" next to system audio is normal while nobody else is talking.
+3. **Devices can change mid-recording — it stays one recording:**
+   - Connect a Bluetooth headset → the app switches to it (per your Settings) and shows *"🔄 New device detected — switched to …"*.
+   - A device disconnects → it falls back to the laptop devices and shows an amber alert.
+   - The mic stops sending audio → the app reconnects it; after repeated failures it moves to another mic (red alert).
+   - A switch leaves at most ~1 second of silence; the timer never freezes. Every switch is written into the meeting, so gaps are explained in the transcript file.
+4. Speak normally. **The transcript appears in real time** (a fast draft, a few seconds behind).
+5. Use **⏸️** to pause/resume, **⏹️** to stop, then **Process** (re-transcribes with the better model; **✕ Cancel** keeps partial results) and **Save Bundle**.
 
-> ⚠️ **Watch the quality verdict while recording.** If it says *Quiet* or *Silent*, fix it before continuing — no AI model can transcribe audio it can't hear. A cheap wired headset consistently beats Bluetooth for recording quality.
-
----
-
-## 5. Transcribing an existing file (mp3, mp4, ...)
-
-You don't need to have recorded with the app — transcribe anything:
-
-1. Click **📂 Import Media** (Meeting screen) or **File → Import Audio/Video** (Ctrl+I).
-2. Pick your file — supported: `mp3, mp4, m4a, wav, opus, ogg, flac, aac, mkv, webm, mov`.
-3. Transcription starts automatically. There is **no need to convert mp4 to mp3 first** — the app decodes the audio track directly (conversion would actually lose quality).
-4. When it finishes, generate documents or save the bundle as usual.
+> ⚠️ Bluetooth headsets drop to phone-call quality when their microphone is used. For the best transcripts, use the headset for **system audio only** and a laptop/USB/wired mic for your voice.
 
 ---
 
-## 5b. The document flow (what happens when you click Save Bundle)
+## 5. Importing recordings (mp3, mp4, …) — the Import Wizard
 
-When you click **Save Bundle**, the app asks **which documents you want** from this meeting:
+Click **📂 Import audio / video** on Home, **File → Import Audio/Video** (Ctrl+I), or simply **drag files onto the window**. The app can't know what a recording is about, so a short wizard asks:
 
-- ☑ Minutes of Meeting (MoM)
-- ☐ FAQ
-- ☐ Summary
-- ☑ *Generate them now using the app's AI backend*
+| Step | What you confirm |
+|---|---|
+| **1 · Files** | One file, or **several parts of one meeting** (e.g. a 7-hour meeting saved as 3 videos). Parts are ordered automatically using the recording time stored inside the files, then a date/time in the names, then numbers in the names. If the evidence is unclear, the order shows **"⚠ Order not confirmed"** and you arrange the parts (drag ↑/↓) before continuing. **▶** plays the last 10 s of a part and the first 10 s of the next — the conversation should flow on. |
+| **2 · Details** | Title, date, client, engagement/project, meeting type, our role, topic/purpose, participants. |
+| **3 · Language** | Spoken language (big accuracy gain for Bahasa) — optionally **🔎 Detect from first 30 seconds**; language the documents should be written in. |
+| **4 · Context** | **Key terms / correct spellings** (products, acronyms, companies — fed to speech recognition) and instructions for the documents. |
+| **5 · Documents** | Suggested by meeting type: MoM, FAQ, Executive summary, Action tracker, Decision log, Items to confirm with the client, or your own. |
+| **6 · Review** | Everything at a glance, with the expected **time, Groq quota and disk space**. Click **Start**. |
 
-Whatever you tick, three files are always written into your meetings folder:
+Then the app transcribes each part in turn onto **one timeline** (part 2 continues where part 1 ended), joins the audio, and — if *Save automatically* is ticked — saves the meeting and shows **"What's next"**.
+
+- **No conversion needed:** mp4 and mp3 are read directly (converting would only lose quality). Only the audio is kept; the video picture is dropped.
+- **Interrupted?** Finished parts are saved as they complete. Import the same files again — or accept the **"Unfinished import — Resume now"** offer when the app starts — and only the remaining parts are transcribed.
+- **Long meetings on Groq's free tier** (2 audio-hours per clock-hour, 8 per day): a 7-hour meeting takes ~3 hours of mostly waiting; the app waits and continues on its own.
+
+---
+
+## 5b. The document flow
+
+Documents are **not** written automatically. After a meeting is saved, three files sit in your meetings folder:
 
 | File | Purpose |
 |---|---|
-| `2026-07-20_Weekly_Sync.mscribe` | The full bundle (audio + transcript + analysis) |
-| `2026-07-20_Weekly_Sync.md` | **Readable transcript — no unzipping needed** |
-| `2026-07-20_Weekly_Sync.request.md` | What documents you asked for, marked PENDING |
+| `2026-09-15_Aanwijzing_CIMB.mscribe` | The full bundle (audio + transcript + context) |
+| `2026-09-15_Aanwijzing_CIMB.md` | **Readable transcript** with a **Meeting context** section (client, engagement, roles, participants, key terms, instructions, part boundaries, any recording issues) |
+| `2026-09-15_Aanwijzing_CIMB.request.md` | The documents you asked for + the same context + writing rules, marked **PENDING** |
 
-Then one of two things produces your documents:
+**Writing the documents with Claude (Cowork):** Home → **Document queue** → select the meeting → **📋 Copy prompt for Claude** → paste it into Cowork. Claude reads the transcript and context and writes the documents next to them.
 
-**Path A — the app writes them (works for everyone, free)**
-Leave *"Generate them now"* ticked. The app calls its AI backend (Groq free tier) and the .docx files appear in the folder immediately. No other software needed.
+**The Document queue** on Home shows every request as ⏳ PENDING / 📝 DRAFTED / ✅ DONE / ⏭ SKIPPED, with buttons to open the transcript or request, mark done, skip, or put back to pending.
 
-**Path B — your own AI assistant writes them (better quality)**
-Untick *"Generate them now"*. The `.request.md` file sits there marked **PENDING**. Any AI assistant with access to the folder — e.g. Claude in Cowork — reads the transcript and produces the documents. Two ways to trigger it:
-
-- Say: *"process pending meeting requests"*
-- Or let a **scheduled task** check the folder automatically (hourly), so documents appear without you asking.
-
-The assistant marks the request **DONE** when finished, so nothing is produced twice.
-
-> **Why two paths?** The app is a standalone program — it cannot call an external AI assistant by itself. The request file is the hand-off: the app states what's needed, the assistant fulfils it. Path A needs nothing extra; Path B gives noticeably better writing.
+**In-app AI (optional):** with a backend configured (Settings → AI Document Structuring, e.g. free Groq), the Save dialog also offers *"Generate them now"* (off by default) and the **✨ Ask AI** button drafts documents inside the app. Treat those as drafts — verify before sharing.
 
 ---
 
@@ -145,6 +151,8 @@ The **Documents** panel (right side) has three buttons, for three ways to turn a
 **✨ Ask AI for a Document** — describe any document you want and the AI writes it from the transcript. Pick a preset (formal MoM, MoM in Bahasa, executive summary, follow-up email, client report, decision log) or type your own instruction. Needs an AI backend configured (Groq is free — see section 8). The finished `.docx` opens automatically.
 
 **📄 Export Transcript** — saves the transcript as `.txt` or `.md`. No AI needed, always free. Paste the result into [claude.ai](https://claude.ai) or any AI chat and ask for whatever document you want. This is also the easiest way to get the raw transcript out of a meeting.
+
+**Convert .md → .docx** — documents written as Markdown (e.g. `…_mom.md`) become Word files with one click: Home → Document queue → **Convert .md → .docx (N)**. Runs locally, no AI, no internet. (Command-line equivalent: `python scripts\convert_md_to_docx.py`.)
 
 ### Make your own template
 
@@ -214,7 +222,8 @@ Local transcription of a 2–3 hour recording takes 1–3 hours of CPU time. The
 |---|---|
 | Meeting bundles (`.mscribe`) | Your project folder (default: `<app folder>\meetings\`) — change in Settings |
 | Companion transcripts (`.md`) | Same folder, next to each bundle |
-| Document requests (`.request.md`) | Same folder — PENDING until fulfilled |
+| Document requests (`.request.md`) | Same folder — shown in Home → Document queue |
+| Unfinished imports (resume files) | `%APPDATA%\MeetingScribe\import_jobs\` — removed once the meeting is saved |
 | Each bundle contains | audio + transcript + analysis + generated docs + metadata, zipped |
 | App settings, models, logs | `%APPDATA%\MeetingScribe\` |
 | Search index | `%APPDATA%\MeetingScribe\meetings.db` (rebuilt automatically from bundles if deleted) |
@@ -230,7 +239,7 @@ Transcription needs a temporary working copy of the audio — an imported mp4/mp
 - **Cancel a transcription** — the app asks whether to keep the meeting or discard it and free the temp audio.
 - **Manual** — **Settings → Storage** shows a live breakdown (recordings / imports / models / cloud jobs) with a **🧹 Clean Now** button.
 
-Your saved `.mscribe` bundles, transcripts and generated documents are **never** touched by cleanup — only the app's own temp area. Compressed bundles are small (~25 MB per audio-hour). You can adjust the retention window or turn off auto-cleanup in Settings → Storage.
+Your saved `.mscribe` bundles, transcripts and generated documents are **never** touched by cleanup — only the app's own temp area. Bundle audio is compressed to Opus (~15–25 MB per audio-hour) — via ffmpeg if installed, otherwise via PyAV, which comes with the app. You can adjust the retention window or turn off auto-cleanup in Settings → Storage.
 
 ---
 
@@ -264,12 +273,19 @@ Your saved `.mscribe` bundles, transcripts and generated documents are **never**
 ```
 Meeting Assistant/
 |-- main.py                    # Entry point
-|-- requirements.txt
+|-- gitignore/requirements.txt # Python dependencies
 |-- scripts/
 |   |-- download_models.py     # Pre-download Whisper models for offline use
+|   |-- convert_md_to_docx.py  # Command-line .md -> .docx conversion
 |-- src/
 |   |-- core/                  # Business logic
-|   |   |-- audio_capture.py   # WASAPI mic + system audio
+|   |   |-- audio_capture.py   # Capture engine: wall-clock mixer, hot-swap, watchdog
+|   |   |-- devices.py         # Device model, Bluetooth grouping, automatic choice
+|   |   |-- device_probe.py    # Helper process that sees hot-plugged devices
+|   |   |-- media_parts.py     # Media probing, part ordering, previews
+|   |   |-- import_plan.py     # Import Wizard answers, estimates, meeting context
+|   |   |-- request_queue.py   # Document queue (.request.md status)
+|   |   |-- doc_convert.py     # Local .md -> .docx
 |   |   |-- transcriber.py     # faster-whisper (local)
 |   |   |-- live_transcriber.py# Real-time transcription during recording
 |   |   |-- groq_transcriber.py# Groq cloud backend (chunking, resume, quota)
@@ -281,7 +297,7 @@ Meeting Assistant/
 |   |   |-- bundle_manager.py  # .mscribe bundles
 |   |   |-- database.py        # SQLite FTS5 search index
 |   |   |-- pipeline.py        # Orchestrator
-|   |-- ui/                    # PyQt6 interface
+|   |-- ui/                    # PyQt6 interface (import_wizard.py = Import Wizard)
 |   |-- utils/
 |   |   |-- housekeeping.py    # Temp-storage cleanup
 |   |   |-- audio_utils.py     # Mixing, resampling, normalization
@@ -297,13 +313,22 @@ Meeting Assistant/
 ## 12. Troubleshooting
 
 **Transcript is empty or nonsense ("cccc...", "thank you for watching")**
-The mic wasn't really recording. Check the recording bar's verdict; run 🎤 Test Microphone in Settings; for Bluetooth pick the *Hands-Free* device. Quiet audio is the #1 cause of bad transcripts.
+The mic wasn't really recording. Check the recording bar's bottom line; run 🎤 Test audio setup in Settings. Quiet audio is the #1 cause of bad transcripts.
 
-**Bluetooth headset records nothing**
-Windows exposes two entries per headset: the stereo one (playback only) and *Hands-Free* (has the mic). Select Hands-Free in Settings → Audio. Note: Windows Bluetooth mics are limited to phone-call quality — a wired/USB mic is noticeably better.
+**A Bluetooth headset connected after starting the app doesn't appear**
+Wait a few seconds (lists refresh automatically) or click ↻. With Microphone/System Audio on **Automatic**, the app also switches to it on its own — even mid-recording.
+
+**Bluetooth headset records nothing / other participants are missing**
+Leave **System Audio on Automatic**: when a headset's mic is used, Windows moves its sound to the Hands-Free output and silences the stereo one — Automatic captures both. If you picked devices manually, the red warning in Settings tells you when a combination would record silence. Bluetooth mics are phone-call quality; for your own voice a wired/USB mic is noticeably better.
+
+**The recording bar says "(nothing playing)" for system audio**
+Normal while nobody else speaks — Windows sends no system audio when nothing plays. The recording continues.
 
 **Bahasa / mixed-language meetings come out wrong**
-Set Settings → Transcription → Language to `ms` or `id` explicitly. Avoid *tiny/base* models for non-English speech — use Groq or local *small* and up.
+Choose the language in the Import Wizard (step 3), add key terms (step 4), and avoid *tiny/base* models for non-English speech — use Groq or local *small* and up.
+
+**An import was interrupted**
+Restart the app and choose **Resume now**, or import the same files again — finished parts are reused.
 
 **"Transcribing..." seems stuck**
 First use downloads the model (up to 3 GB) — the status bar says so; let it finish once, or pre-download with `python scripts\download_models.py`. During transcription you should see a percentage and ETA. Click ✕ Cancel to stop and keep the partial transcript.

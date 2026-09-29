@@ -10,7 +10,8 @@ from typing import Optional
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QScrollArea, QFrame, QSizePolicy, QSpacerItem
+    QLineEdit, QScrollArea, QFrame, QSizePolicy, QSpacerItem,
+    QListWidget, QListWidgetItem, QCheckBox, QMessageBox, QApplication,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize
 from PyQt6.QtGui import QFont
@@ -92,6 +93,143 @@ class MeetingCard(QFrame):
         super().mousePressEvent(event)
 
 
+class QueuePanel(QFrame):
+    """Document request queue: what still needs documents written."""
+
+    ICONS = {"PENDING": "⏳", "DRAFTED": "📝", "DONE": "✅", "SKIPPED": "⏭"}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("""
+            QueuePanel { background-color: rgba(22, 22, 42, 0.85);
+                         border: 1px solid rgba(255, 255, 255, 0.06);
+                         border-radius: 12px; }
+        """)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(6)
+
+        head = QHBoxLayout()
+        title = QLabel("Document queue")
+        title.setFont(QFont("Inter", 13, QFont.Weight.DemiBold))
+        head.addWidget(title)
+        self.counts_label = QLabel("")
+        self.counts_label.setStyleSheet("color: #a0a0b8; font-size: 12px;")
+        head.addWidget(self.counts_label)
+        head.addStretch()
+        self.show_all = QCheckBox("Show done / skipped")
+        self.show_all.toggled.connect(lambda _: self.refresh())
+        head.addWidget(self.show_all)
+        self.convert_btn = QPushButton("Convert .md → .docx")
+        self.convert_btn.setToolTip("Turn document .md files (written by Claude) into "
+                                    "Word files — locally, no AI, no internet")
+        self.convert_btn.clicked.connect(self._on_convert)
+        head.addWidget(self.convert_btn)
+        lay.addLayout(head)
+
+        self.list = QListWidget()
+        self.list.setMaximumHeight(150)
+        self.list.itemDoubleClicked.connect(lambda _: self._open("request"))
+        lay.addWidget(self.list)
+
+        row = QHBoxLayout()
+        for text, fn, tip in (
+                ("📋 Copy prompt for Claude", self._copy_prompt,
+                 "Copy a ready-made request to paste into Claude (Cowork)"),
+                ("Open transcript", lambda: self._open("transcript"), ""),
+                ("Open request", lambda: self._open("request"), ""),
+                ("Mark done", lambda: self._set("DONE"), ""),
+                ("Skip", lambda: self._set("SKIPPED"), "Take this meeting out of the queue"),
+                ("Back to pending", lambda: self._set("PENDING"), "")):
+            b = QPushButton(text)
+            if tip:
+                b.setToolTip(tip)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addStretch()
+        lay.addLayout(row)
+        self._items = []
+
+    def folder(self) -> str:
+        from src.core.settings import Settings
+        return Settings.instance().get_project_folder()
+
+    def refresh(self):
+        from src.core import request_queue, doc_convert
+        items = request_queue.list_requests(self.folder())
+        c = request_queue.counts(items)
+        self.counts_label.setText(
+            f"  {c['PENDING']} pending · {c['DRAFTED']} drafted · "
+            f"{c['DONE']} done · {c['SKIPPED']} skipped")
+        shown = items if self.show_all.isChecked() else \
+            [i for i in items if i.status in ("PENDING", "DRAFTED")]
+        self._items = shown
+        self.list.clear()
+        for it in shown:
+            docs = ", ".join(it.documents) if it.documents else "—"
+            li = QListWidgetItem(f"{self.ICONS.get(it.status, '•')} {it.status:<8} "
+                                 f"{it.title}  ·  {it.date}  ·  {docs}")
+            li.setToolTip(it.status_note or it.path)
+            self.list.addItem(li)
+        if not shown:
+            li = QListWidgetItem("Nothing waiting — every requested document is done "
+                                 "or skipped.")
+            li.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.list.addItem(li)
+        n = len(doc_convert.find_unconverted(self.folder()))
+        self.convert_btn.setText(f"Convert .md → .docx ({n})")
+        self.convert_btn.setEnabled(n > 0)
+
+    def _selected(self):
+        r = self.list.currentRow()
+        if 0 <= r < len(self._items):
+            return self._items[r]
+        QMessageBox.information(self, "Document queue", "Select a meeting in the list first.")
+        return None
+
+    def _copy_prompt(self):
+        from src.core import request_queue
+        it = self._selected()
+        if it:
+            QApplication.clipboard().setText(request_queue.claude_prompt(it))
+            QMessageBox.information(self, "Copied",
+                                    "Prompt copied — paste it into Claude (Cowork).")
+
+    def _open(self, which: str):
+        it = self._selected()
+        if not it:
+            return
+        path = it.transcript_path if which == "transcript" else it.path
+        if os.path.exists(path):
+            os.startfile(path)
+        else:
+            QMessageBox.warning(self, "Not found", f"File not found:\n{path}")
+
+    def _set(self, status: str):
+        from src.core import request_queue
+        it = self._selected()
+        if it:
+            request_queue.set_status(it.path, status)
+            self.refresh()
+
+    def _on_convert(self):
+        from src.core import doc_convert
+        paths = doc_convert.find_unconverted(self.folder())
+        if not paths:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            done, failed = doc_convert.convert_many(paths)
+        finally:
+            QApplication.restoreOverrideCursor()
+        msg = f"Converted {len(done)} document(s) to .docx."
+        if failed:
+            msg += "\n\nFailed:\n" + "\n".join(f"• {os.path.basename(p)}: {e}"
+                                                for p, e in failed)
+        QMessageBox.information(self, "Convert to .docx", msg)
+        self.refresh()
+
+
 class HomeView(QWidget):
     """
     Home screen showing past meetings and the new meeting button.
@@ -99,6 +237,7 @@ class HomeView(QWidget):
 
     meeting_selected = pyqtSignal(str)  # bundle_path
     new_meeting_requested = pyqtSignal()
+    import_requested = pyqtSignal()
 
     def __init__(self, pipeline: MeetingPipeline, parent=None):
         super().__init__(parent)
@@ -127,6 +266,15 @@ class HomeView(QWidget):
         new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         new_btn.setMinimumHeight(44)
         new_btn.clicked.connect(self.new_meeting_requested.emit)
+
+        import_btn = QPushButton("  📂  Import audio / video  ")
+        import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        import_btn.setMinimumHeight(44)
+        import_btn.setToolTip("Transcribe recordings (mp4, mp3, ...) — one file or "
+                              "several parts of one meeting. You can also drag "
+                              "files onto the window.")
+        import_btn.clicked.connect(self.import_requested.emit)
+        header_layout.addWidget(import_btn)
         header_layout.addWidget(new_btn)
 
         layout.addLayout(header_layout)
@@ -137,6 +285,10 @@ class HomeView(QWidget):
         self.search_input.setMinimumHeight(40)
         self.search_input.textChanged.connect(self._on_search)
         layout.addWidget(self.search_input)
+
+        # ── Document queue ──
+        self.queue_panel = QueuePanel()
+        layout.addWidget(self.queue_panel)
 
         # ── Meeting List (scrollable) ──
         scroll = QScrollArea()
@@ -219,5 +371,9 @@ class HomeView(QWidget):
             logger.warning(f"Search error: {e}")
 
     def refresh(self):
-        """Reload the meeting list."""
+        """Reload the meeting list and the document queue."""
         self._load_meetings()
+        try:
+            self.queue_panel.refresh()
+        except Exception as e:
+            logger.warning(f"Could not load document queue: {e}")

@@ -265,12 +265,31 @@ class AudioPlayer(QFrame):
         self._audio_path = audio_path
         self._player.setSource(QUrl.fromLocalFile(audio_path))
 
-        # Load waveform data for display
+        # Load waveform data for display. WAV files are read block by block
+        # (a 7-hour meeting would otherwise need ~1.6 GB of RAM just to draw
+        # 200 bars); other formats fall back to a full load.
         try:
-            from src.utils.audio_utils import load_wav
-            audio_data, sr = load_wav(audio_path)
-            self.waveform.set_audio_data(audio_data, sr)
-            self._duration = len(audio_data) / sr
+            if audio_path.lower().endswith(".wav"):
+                import wave
+                with wave.open(audio_path, "rb") as wf:
+                    sr, frames, ch = wf.getframerate(), wf.getnframes(), wf.getnchannels()
+                    per_bar = max(1, frames // self.waveform._num_bars)
+                    peaks = []
+                    while True:
+                        raw = wf.readframes(per_bar)
+                        if not raw:
+                            break
+                        a = np.frombuffer(raw, dtype=np.int16)
+                        peaks.append(float(np.abs(a).max()) / 32768.0 if len(a) else 0.0)
+                top = max(peaks) if peaks else 1.0
+                self.waveform._waveform_data = [x / top if top else 0.0 for x in peaks]
+                self.waveform.update()
+                self._duration = frames / float(sr or 1)
+            else:
+                from src.utils.audio_utils import load_wav
+                audio_data, sr = load_wav(audio_path)
+                self.waveform.set_audio_data(audio_data, sr)
+                self._duration = len(audio_data) / sr
             self.waveform.set_duration(self._duration)
             self.duration_label.setText(self._format_time(self._duration))
             logger.info(f"Audio loaded: {audio_path} ({self._duration:.1f}s)")
