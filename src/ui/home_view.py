@@ -167,9 +167,14 @@ class QueuePanel(QFrame):
         self.list.clear()
         for it in shown:
             docs = ", ".join(it.documents) if it.documents else "—"
+            warn = (f"  ·  ⚠ INCOMPLETE TRANSCRIPT (~{round(it.missing_sec / 60)} min "
+                    "missing — open the meeting to finish it)") if it.incomplete else ""
             li = QListWidgetItem(f"{self.ICONS.get(it.status, '•')} {it.status:<8} "
-                                 f"{it.title}  ·  {it.date}  ·  {docs}")
+                                 f"{it.title}  ·  {it.date}  ·  {docs}{warn}")
             li.setToolTip(it.status_note or it.path)
+            if it.incomplete:
+                from PyQt6.QtGui import QColor
+                li.setForeground(QColor("#f59e0b"))
             self.list.addItem(li)
         if not shown:
             li = QListWidgetItem("Nothing waiting — every requested document is done "
@@ -191,6 +196,13 @@ class QueuePanel(QFrame):
         from src.core import request_queue
         it = self._selected()
         if it:
+            if it.incomplete:
+                QMessageBox.warning(
+                    self, "Transcript incomplete",
+                    f"“{it.title}” has about {round(it.missing_sec / 60)} min at the end "
+                    "without text. Open the meeting and click “Transcribe missing part” "
+                    "first — otherwise the documents would miss that part.")
+                return
             QApplication.clipboard().setText(request_queue.claude_prompt(it))
             QMessageBox.information(self, "Copied",
                                     "Prompt copied — paste it into Claude (Cowork).")
@@ -230,6 +242,86 @@ class QueuePanel(QFrame):
         self.refresh()
 
 
+class UnfinishedImportsPanel(QFrame):
+    """Imports that stopped before finishing (app closed, Cancel pressed).
+    Hidden when there are none. Resume continues exactly where it stopped:
+    finished files and finished 10-minute Groq pieces are not redone."""
+
+    resume_requested = pyqtSignal(object)   # ImportPlan
+    changed = pyqtSignal()
+
+    def __init__(self, pipeline: MeetingPipeline, parent=None):
+        super().__init__(parent)
+        self.pipeline = pipeline
+        self.setStyleSheet("""
+            UnfinishedImportsPanel { background-color: rgba(245, 158, 11, 0.08);
+                                     border: 1px solid rgba(245, 158, 11, 0.35);
+                                     border-radius: 12px; }
+        """)
+        self._lay = QVBoxLayout(self)
+        self._lay.setContentsMargins(16, 10, 16, 10)
+        self._lay.setSpacing(6)
+        self.hide()
+
+    def refresh(self):
+        while self._lay.count():
+            item = self._lay.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+            elif item.layout():
+                lay = item.layout()
+                while lay.count():
+                    sub = lay.takeAt(0)
+                    if sub.widget():
+                        sub.widget().deleteLater()
+        try:
+            jobs = self.pipeline.pending_import_jobs()
+        except Exception as e:
+            logger.warning(f"Could not check unfinished imports: {e}")
+            jobs = []
+        if not jobs:
+            self.hide()
+            return
+        title = QLabel(f"⏸  Unfinished imports ({len(jobs)})")
+        title.setFont(QFont("Inter", 13, QFont.Weight.DemiBold))
+        self._lay.addWidget(title)
+        for job in jobs:
+            plan = job["plan"]
+            row = QHBoxLayout()
+            name = plan.title or plan.parts[0].name
+            lbl = QLabel(f"<b>{name}</b> &nbsp;·&nbsp; {job['summary']}")
+            lbl.setStyleSheet("color: #e0e0f0; font-size: 12px;")
+            lbl.setToolTip("Finished files and finished 10-minute pieces are kept "
+                           "and won't be sent to Groq again.\n\n" +
+                           "\n".join(p.path for p in plan.parts))
+            lbl.setWordWrap(True)
+            row.addWidget(lbl, 1)
+            resume = QPushButton("▶ Resume")
+            resume.setCursor(Qt.CursorShape.PointingHandCursor)
+            resume.clicked.connect(lambda _=False, p=plan: self.resume_requested.emit(p))
+            row.addWidget(resume)
+            discard = QPushButton("Discard")
+            discard.setToolTip("Forget this unfinished import (source files are not touched)")
+            discard.clicked.connect(lambda _=False, j=job: self._discard(j))
+            row.addWidget(discard)
+            self._lay.addLayout(row)
+        self.show()
+
+    def _discard(self, job):
+        name = job["plan"].title or job["plan"].parts[0].name
+        if QMessageBox.question(
+                self, "Discard unfinished import",
+                f"Forget the unfinished import of “{name}”?\n\n"
+                "The original video/audio files are not touched, but the "
+                "progress so far will not be offered for resume.") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self.pipeline.discard_import_job(job["path"])
+        self.refresh()
+        self.changed.emit()
+
+
 class HomeView(QWidget):
     """
     Home screen showing past meetings and the new meeting button.
@@ -238,6 +330,7 @@ class HomeView(QWidget):
     meeting_selected = pyqtSignal(str)  # bundle_path
     new_meeting_requested = pyqtSignal()
     import_requested = pyqtSignal()
+    resume_import_requested = pyqtSignal(object)  # ImportPlan
 
     def __init__(self, pipeline: MeetingPipeline, parent=None):
         super().__init__(parent)
@@ -285,6 +378,11 @@ class HomeView(QWidget):
         self.search_input.setMinimumHeight(40)
         self.search_input.textChanged.connect(self._on_search)
         layout.addWidget(self.search_input)
+
+        # ── Unfinished imports (hidden when none) ──
+        self.imports_panel = UnfinishedImportsPanel(self.pipeline)
+        self.imports_panel.resume_requested.connect(self.resume_import_requested.emit)
+        layout.addWidget(self.imports_panel)
 
         # ── Document queue ──
         self.queue_panel = QueuePanel()
@@ -373,6 +471,10 @@ class HomeView(QWidget):
     def refresh(self):
         """Reload the meeting list and the document queue."""
         self._load_meetings()
+        try:
+            self.imports_panel.refresh()
+        except Exception as e:
+            logger.warning(f"Could not load unfinished imports: {e}")
         try:
             self.queue_panel.refresh()
         except Exception as e:

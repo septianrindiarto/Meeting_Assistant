@@ -21,6 +21,40 @@ from datetime import date
 from typing import Dict, List, Optional
 
 STATUSES = ("PENDING", "DRAFTED", "DONE", "SKIPPED")
+INCOMPLETE_GAP_SEC = 300          # more than 5 min without text at the end
+WARNING_PREFIX = "> ⚠ Incomplete transcript"
+
+
+def bundle_coverage(bundle_path: str) -> Optional[dict]:
+    """How much of a saved meeting's audio has transcript text.
+
+    Reads only meta.json + transcript.json from the bundle (small), so it's
+    cheap enough to run for every meeting in the queue.
+    """
+    import json
+    import zipfile
+    try:
+        with zipfile.ZipFile(bundle_path) as z:
+            names = z.namelist()
+            meta = json.loads(z.read("meta.json")) if "meta.json" in names else {}
+            tr = json.loads(z.read("transcript.json")) if "transcript.json" in names else []
+    except Exception:
+        return None
+    duration = float(meta.get("duration_seconds") or 0)
+    end = max((float(x.get("end", 0)) for x in tr), default=0.0)
+    return {"duration": duration, "end": end,
+            "missing": max(0.0, duration - end) if duration else 0.0}
+
+
+def format_ts(seconds: float) -> str:
+    s = int(seconds or 0)
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+
+
+def coverage_warning(end: float, duration: float) -> str:
+    return (f"{WARNING_PREFIX}: text covers only 0:00–{format_ts(end)} of "
+            f"{format_ts(duration)} (~{round((duration - end) / 60)} min missing). "
+            "Open the meeting and click “Transcribe missing part” before writing documents.")
 _STATUS_RE = re.compile(r"^>\s*Status:\s*\*\*(\w+)\*\*", re.I)
 
 
@@ -33,6 +67,15 @@ class RequestItem:
     status: str = "PENDING"
     status_note: str = ""
     documents: List[str] = field(default_factory=list)
+    # Transcript coverage (read from the bundle): seconds of audio at the
+    # end that have no text. > INCOMPLETE_GAP_SEC means incomplete.
+    missing_sec: float = 0.0
+    covered_until: float = 0.0
+    duration_sec: float = 0.0
+
+    @property
+    def incomplete(self) -> bool:
+        return self.missing_sec > INCOMPLETE_GAP_SEC
 
     @property
     def base(self) -> str:
@@ -79,7 +122,31 @@ def parse_request(path: str) -> Optional[RequestItem]:
             item.documents.append(s[4:].strip())
     if item.status not in STATUSES:
         item.status = "PENDING"
+    if os.path.exists(item.bundle_path):
+        cov = bundle_coverage(item.bundle_path)
+        if cov:
+            item.missing_sec = cov["missing"]
+            item.covered_until = cov["end"]
+            item.duration_sec = cov["duration"]
     return item
+
+
+def sync_coverage_warning(request_path: str, end: float, duration: float) -> None:
+    """Add, update or remove the incomplete-transcript warning line in a
+    request file, leaving everything else (including status) untouched."""
+    if not os.path.exists(request_path):
+        return
+    with open(request_path, encoding="utf-8") as f:
+        lines = [ln for ln in f.read().splitlines() if not ln.startswith(WARNING_PREFIX)]
+    if duration and duration - end > INCOMPLETE_GAP_SEC:
+        at = next((i + 1 for i, ln in enumerate(lines) if _STATUS_RE.match(ln.strip())), 1)
+        while at < len(lines) and lines[at].strip().startswith(">"):
+            at += 1
+        lines[at:at] = [coverage_warning(end, duration)]
+    tmp = request_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, request_path)
 
 
 def list_requests(folder: str) -> List[RequestItem]:
@@ -144,6 +211,11 @@ def claude_prompt(item: RequestItem, folder_hint: str = "meetings") -> str:
     name = os.path.basename(item.path)
     transcript = os.path.basename(item.transcript_path)
     docs = ", ".join(item.documents) or "the requested documents"
+    if item.incomplete:
+        return (f"Note: the transcript of \"{item.title}\" is INCOMPLETE — it covers "
+                f"only 0:00–{format_ts(item.covered_until)} of "
+                f"{format_ts(item.duration_sec)}. Transcribe the missing part in "
+                "Meeting Scribe first (open the meeting → “Transcribe missing part”).")
     return (f"Please produce the documents requested in `{folder_hint}/{name}` "
             f"({docs}) for the meeting \"{item.title}\". Read the transcript "
             f"`{folder_hint}/{transcript}` and the meeting context in both files, "

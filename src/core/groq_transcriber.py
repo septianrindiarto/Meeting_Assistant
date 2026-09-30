@@ -137,7 +137,7 @@ class GroqTranscriber:
         if already_done:
             self._status(
                 f"Resuming previous job — {already_done} of {len(chunks)} "
-                "parts already transcribed (no quota re-spent)"
+                "10-min pieces already transcribed (no quota re-spent)"
             )
         # Restore the quota window if it's still current
         saved_ws = job.get("window_start")
@@ -172,7 +172,7 @@ class GroqTranscriber:
             if self.cancel_requested:      # may have been set during wait
                 return all_segments
 
-            self._status(f"Uploading part {i + 1} of {len(chunks)}...")
+            self._status(f"Transcribing piece {i + 1} of {len(chunks)} (10 min each)...")
             try:
                 segments = self._transcribe_chunk(chunk, offset, i, len(chunks))
                 all_segments.extend(segments)
@@ -238,9 +238,19 @@ class GroqTranscriber:
 
             job = safe_read_json(job_path)
             if job and job.get("n_chunks") == n_chunks:
+                if job_key and not job.get("job_key"):
+                    job["job_key"] = job_key   # lets the app show piece progress
                 return job_path, job
 
-            job = {"job_id": job_id, "n_chunks": n_chunks, "completed": {}}
+            job = {"job_id": job_id, "n_chunks": n_chunks, "completed": {},
+                   "job_key": job_key or ""}
+            if job_key:
+                # Written now (not only after the first piece) so the Home
+                # screen can show "0 of N pieces" for a freshly started part.
+                try:
+                    safe_write_json(job_path, job)
+                except Exception:
+                    pass
             return job_path, job
         except Exception as e:
             logger.warning(f"Job persistence unavailable: {e}")
@@ -311,16 +321,18 @@ class GroqTranscriber:
         wait_until = self._window_start + 3600
         wait_sec = max(0, wait_until - now)
         self._status(
-            f"Hourly free-tier quota reached — part {chunk_idx + 1} of "
-            f"{total_chunks} will be sent in {int(wait_sec / 60) + 1} min..."
+            f"Groq free-tier hourly limit reached — piece {chunk_idx + 1} of "
+            f"{total_chunks} continues automatically in {int(wait_sec / 60) + 1} min. "
+            "Keep the app open (minimizing is fine) — don't cancel."
         )
         while time.time() < wait_until:
             if self.cancel_requested:
                 return
             remaining = int((wait_until - time.time()) / 60) + 1
             self._status(
-                f"Waiting for quota window — {remaining} min until part "
-                f"{chunk_idx + 1} of {total_chunks}..."
+                f"Paused by Groq's hourly limit — continues automatically in "
+                f"{remaining} min (piece {chunk_idx + 1} of {total_chunks}). "
+                "Don't cancel."
             )
             time.sleep(min(30, max(1, wait_until - time.time())))
 
@@ -378,7 +390,7 @@ class GroqTranscriber:
                         retry_after = int(resp.headers.get("retry-after", "60"))
                         retry_after = min(retry_after, 3700)
                         self._status(
-                            f"Groq rate limit hit — retrying part {idx + 1} of "
+                            f"Groq rate limit hit — retrying piece {idx + 1} of "
                             f"{total} in {retry_after}s..."
                         )
                         waited = 0
@@ -426,7 +438,11 @@ class GroqTranscriber:
     def _parse_response(self, payload: dict, offset: float) -> List[TranscriptSegment]:
         """Convert Groq's verbose_json into TranscriptSegments with the
         chunk offset applied and hallucination filtering."""
-        language = payload.get("language", "") or ""
+        language = (payload.get("language", "") or "").strip().lower()
+        # Groq returns names ("indonesian"); store ISO codes like local Whisper.
+        language = {"indonesian": "id", "malay": "ms", "english": "en",
+                    "javanese": "jw", "sundanese": "su", "tagalog": "tl"}.get(
+                        language, language[:2] if len(language) > 2 else language)
         segments = []
         for seg in payload.get("segments", []):
             text = (seg.get("text") or "").strip()
@@ -438,6 +454,6 @@ class GroqTranscriber:
                 end=float(seg.get("end", 0.0)) + offset,
                 text=text,
                 confidence=avg_logprob,
-                language=language[:2] if language else "en",
+                language=language or "en",
             ))
         return segments

@@ -230,6 +230,7 @@ class MainWindow(QMainWindow):
         self.home_view.meeting_selected.connect(self._on_meeting_selected)
         self.home_view.new_meeting_requested.connect(self._on_new_meeting)
         self.home_view.import_requested.connect(self._on_import_media)
+        self.home_view.resume_import_requested.connect(self._resume_import)
 
         # Connect meeting workspace signals
         self.meeting_workspace.meeting_saved.connect(self._on_meeting_saved)
@@ -278,28 +279,55 @@ class MainWindow(QMainWindow):
             self._on_import_media(media)
 
     # ── Resume interrupted imports ──
+    def _resume_import(self, plan):
+        """Continue an unfinished import (from the Home panel or the start-up
+        offer). Finished files and 10-minute Groq pieces are reused."""
+        from src.core.pipeline import PipelineState
+        if self.pipeline.state != PipelineState.IDLE:
+            QMessageBox.warning(self, "Busy",
+                                "Finish or stop the current recording/processing first.")
+            return
+        m = self.pipeline.meeting
+        if m is not None and not m.bundle_path and m.transcript:
+            if QMessageBox.question(
+                    self, "Unsaved meeting open",
+                    "The meeting open in the workspace hasn't been saved. "
+                    "Resuming will replace it on screen.\n\nContinue anyway?") \
+                    != QMessageBox.StandardButton.Yes:
+                return
+        self._switch_view(1)
+        self.meeting_workspace.start_import_plan(plan)
+
     def _offer_resume_imports(self):
+        self.home_view.refresh()     # shows the "Unfinished imports" panel too
         try:
             jobs = self.pipeline.pending_import_jobs()
         except Exception as e:
             logger.warning(f"Could not check unfinished imports: {e}")
             return
-        for job in jobs[:1]:
-            plan = job["plan"]
-            box = QMessageBox(self)
-            box.setWindowTitle("Unfinished import")
-            box.setText(f"The import of “{plan.title}” was interrupted.\n\n"
-                        f"{job['done']} of {job['total']} part(s) are already "
-                        "transcribed and won't be repeated.")
-            resume = box.addButton("Resume now", QMessageBox.ButtonRole.AcceptRole)
-            box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
-            discard = box.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
-            box.exec()
-            if box.clickedButton() is resume:
-                self._switch_view(1)
-                self.meeting_workspace.start_import_plan(plan)
-            elif box.clickedButton() is discard:
-                self.pipeline.discard_import_job(job["path"])
+        if not jobs:
+            return
+        job = jobs[0]
+        plan = job["plan"]
+        more = (f"\n\n{len(jobs) - 1} other unfinished import(s) are listed on "
+                "the Home screen.") if len(jobs) > 1 else ""
+        box = QMessageBox(self)
+        box.setWindowTitle("Unfinished import")
+        box.setText(f"The import of “{plan.title or plan.parts[0].name}” didn't finish.\n\n"
+                    f"Progress: {job['summary']}.\n\n"
+                    "Everything already transcribed is kept and won't be sent "
+                    "to Groq again." + more)
+        box.setInformativeText("Choosing “Later” keeps it under Home → "
+                               "Unfinished imports, where you can resume any time.")
+        resume = box.addButton("Resume now", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        discard = box.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
+        box.exec()
+        if box.clickedButton() is resume:
+            self._resume_import(plan)
+        elif box.clickedButton() is discard:
+            self.pipeline.discard_import_job(job["path"])
+            self.home_view.refresh()
 
     def _on_open_bundle(self):
         """Open an existing .mscribe bundle."""

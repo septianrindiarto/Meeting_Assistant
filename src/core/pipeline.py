@@ -613,7 +613,7 @@ class MeetingPipeline:
                     self._set_state(PipelineState.IDLE)
                     self._report_progress(
                         f"Import paused at {label.lower()} — finished parts are "
-                        "kept. Import the same files again to resume.")
+                        "kept. Resume it any time from the Home screen (Unfinished imports).")
                     return
                 job["parts"][str(i)] = {"duration": dur,
                                         "segments": [x.to_dict() for x in segs]}
@@ -667,15 +667,200 @@ class MeetingPipeline:
         self.meeting.metadata.duration = format_duration(total)
         self.meeting.metadata.duration_seconds = total
 
+    # ─── Transcript completeness ─────────────────────────────────
+
+    def transcript_coverage(self, meeting: Optional[Meeting] = None) -> Optional[dict]:
+        """{'end', 'duration', 'missing', 'incomplete'} for a meeting's transcript.
+
+        A transcript is incomplete when more than 5 minutes at the END of the
+        audio have no text — e.g. a Groq job stopped at the hourly quota limit
+        and the partial result was saved.
+        """
+        from src.core.request_queue import INCOMPLETE_GAP_SEC
+        m = meeting or self.meeting
+        if not m or not m.metadata.duration_seconds:
+            return None
+        end = max((x.end for x in m.transcript), default=0.0)
+        dur = float(m.metadata.duration_seconds)
+        missing = max(0.0, dur - end)
+        return {"end": end, "duration": dur, "missing": missing,
+                "incomplete": missing > INCOMPLETE_GAP_SEC}
+
+    def _language_code(self) -> Optional[str]:
+        """Spoken-language code for this meeting (wizard choice, else Settings)."""
+        from src.core.import_plan import LANGUAGES
+        label = (self.meeting.metadata.language if self.meeting else "") or ""
+        code = next((c for lbl, c in LANGUAGES if lbl == label), None)
+        return code or self.settings.get("transcription_language")
+
+    def complete_missing_transcript(self) -> int:
+        """Transcribe ONLY the untranscribed end of the current meeting and
+        append it on the same timeline. If the meeting is already saved, the
+        bundle, transcript .md and request file are updated in place (no
+        second copy). Returns the number of segments added."""
+        from src.core.media_parts import extract_clip
+        from src.core.transcriber import WhisperTranscriber
+        from src.utils.audio_utils import save_wav_chunk
+
+        cov = self.transcript_coverage()
+        if not cov or not cov["incomplete"]:
+            return 0
+        m = self.meeting
+        if not m.audio_path or not os.path.exists(m.audio_path):
+            raise ValueError("This meeting's audio isn't available — reopen it from Home.")
+
+        start = cov["end"]
+        self._set_state(PipelineState.TRANSCRIBING)
+        self._report_progress(
+            f"Reading audio {_ts(start)}–{_ts(cov['duration'])} "
+            f"({round(cov['missing'] / 60)} min)...")
+        audio = extract_clip(m.audio_path, start, cov["duration"] - start + 1.0)
+        wav = os.path.join(str(get_temp_dir()), f"complete_{int(start)}_{int(time.time())}.wav")
+        save_wav_chunk(audio, wav, 16000)
+        self._working_audio_paths.append(wav)
+
+        base = list(m.transcript)
+        terms = [t for t in (m.metadata.key_terms or [])]
+        prompt = WhisperTranscriber.CODE_MIXED_PROMPT
+        if terms:
+            prompt = (prompt + " " + ", ".join(terms) + ".")[:600]
+
+        def _partial(segs, base=base):
+            self._default_partial(base + [self._shift(x, start) for x in segs])
+
+        segs = self._transcribe_to_segments(
+            wav, language=self._language_code(), prompt=prompt,
+            job_key=f"{m.bundle_path or m.metadata.title}|from|{int(start)}",
+            on_partial=_partial, label="Missing part")
+        new = [self._shift(x, start) for x in segs if x.end > 0.5]
+        m.transcript = base + new
+        self._default_partial(m.transcript)
+        cancelled = self._transcriber is not None and \
+            getattr(self._transcriber, "cancel_requested", False)
+
+        if m.bundle_path and os.path.exists(m.bundle_path):
+            self._update_saved_meeting()
+        try:
+            os.remove(wav)
+        except OSError:
+            pass
+        self._set_state(PipelineState.IDLE)
+        after = self.transcript_coverage()
+        if cancelled or (after and after["incomplete"]):
+            self._report_progress(
+                f"Added {len(new)} segments — still incomplete up to "
+                f"{_ts(after['end'] if after else 0)}. Run it again to continue.")
+        else:
+            self._report_progress(f"Missing part transcribed — {len(new)} segments added. "
+                                  "Transcript is complete.")
+        return len(new)
+
+    def _update_saved_meeting(self) -> None:
+        """Write the current transcript back into the SAME saved meeting."""
+        from src.core.request_queue import sync_coverage_warning
+        m = self.meeting
+        self._report_progress("Updating the saved meeting...")
+        self._bundle_manager.update_bundle(m.bundle_path, m)
+        base = os.path.splitext(m.bundle_path)[0]
+        try:
+            self.export_transcript(base + ".md", fmt="md")
+        except Exception as e:
+            logger.warning(f"Could not rewrite transcript .md: {e}")
+        cov = self.transcript_coverage() or {"end": 0, "duration": 0}
+        sync_coverage_warning(base + ".request.md", cov["end"], cov["duration"])
+        try:
+            self._database.index_bundle(
+                bundle_path=m.bundle_path, title=m.metadata.title,
+                date=m.metadata.date, duration=m.metadata.duration,
+                duration_seconds=m.metadata.duration_seconds,
+                speakers=", ".join(m.metadata.attendees or m.metadata.participants),
+                transcript_text=" ".join(x.text for x in m.transcript),
+                file_size_mb=os.path.getsize(m.bundle_path) / 1024 / 1024,
+            )
+        except Exception as e:
+            logger.warning(f"Could not re-index meeting: {e}")
+
+    def _cloud_piece_progress(self, part_key: str, language) -> Optional[tuple]:
+        """(pieces_done, pieces_total) of the Groq job for one import part,
+        or None if that part has no cloud job yet (or runs on local Whisper).
+        Groq splits audio into ~10-minute pieces; each finished piece is
+        saved, so this is exactly what a resume will NOT redo."""
+        import hashlib
+        folder = str(get_app_data_dir() / "cloud_jobs")
+        if not os.path.isdir(folder):
+            return None
+        found = None
+        for name in os.listdir(folder):
+            if not (name.startswith("groq_job_") and name.endswith(".json")):
+                continue
+            job = safe_read_json(os.path.join(folder, name)) or {}
+            if job.get("job_key") == part_key:
+                found = job
+                break
+        if found is None:
+            # Job files written before job_key was stored: rebuild the id.
+            key = f"{part_key}|{self.settings.get('groq_model', 'whisper-large-v3-turbo')}|{language}"
+            job_id = hashlib.md5(key.encode("utf-8")).hexdigest()[:16]
+            found = safe_read_json(os.path.join(folder, f"groq_job_{job_id}.json"))
+        if not found or not found.get("n_chunks"):
+            return None
+        return len(found.get("completed", {})), int(found["n_chunks"])
+
+    def import_job_progress(self, job: dict, plan: ImportPlan) -> dict:
+        """Human-meaningful progress of an unfinished import: whole files
+        done, and 10-minute pieces done inside the file that was running."""
+        parts_done = job.get("parts", {})
+        total = len(plan.parts)
+        done_files = len(parts_done)
+        current = next((i for i in range(total) if str(i) not in parts_done), None)
+        pieces = None
+        if current is not None:
+            p = plan.parts[current]
+            pieces = self._cloud_piece_progress(f"{p.path}|{p.size}", plan.language)
+        # Rough time still to transcribe (audio minutes, not wall time)
+        left = 0.0
+        for i, p in enumerate(plan.parts):
+            if str(i) in parts_done:
+                continue
+            dur = p.duration or 0.0
+            if i == current and pieces and pieces[1]:
+                dur = dur * (1 - pieces[0] / pieces[1])
+            left += dur
+        return {"files_done": done_files, "files_total": total,
+                "current_part": current, "pieces": pieces,
+                "minutes_left": round(left / 60)}
+
     @staticmethod
-    def pending_import_jobs() -> List[dict]:
-        """Unfinished imports that can be resumed (app restarted mid-import)."""
+    def describe_import_progress(prog: dict) -> str:
+        """One line like 'File 1 of 1: 12 of 15 pieces transcribed (~25 min left)'."""
+        total = prog["files_total"]
+        cur = prog["current_part"]
+        bits = []
+        if total > 1:
+            bits.append(f"{prog['files_done']} of {total} files finished")
+        if cur is not None:
+            where = f"file {cur + 1} of {total}: " if total > 1 else ""
+            if prog["pieces"]:
+                d, n = prog["pieces"]
+                bits.append(f"{where}{d} of {n} 10-min pieces transcribed")
+            else:
+                bits.append(f"{where}not started yet")
+        if prog["minutes_left"]:
+            bits.append(f"~{prog['minutes_left']} min of audio left")
+        return " · ".join(bits) or "ready to finish"
+
+    def pending_import_jobs(self) -> List[dict]:
+        """Unfinished imports that can be resumed (app closed, or Cancel
+        pressed mid-import). The import running right now is excluded."""
         out = []
         folder = _import_jobs_dir()
+        active = self._current_import_job if self.state != PipelineState.IDLE else None
         for name in os.listdir(folder):
             if not name.startswith("import_") or not name.endswith(".json"):
                 continue
             path = os.path.join(folder, name)
+            if active and os.path.abspath(path) == os.path.abspath(active):
+                continue
             job = safe_read_json(path) or {}
             if job.get("status") != "running" or "plan" not in job:
                 continue
@@ -685,8 +870,19 @@ class MeetingPipeline:
                 continue
             if not all(os.path.exists(p.path) for p in plan.parts):
                 continue  # source files moved/deleted — can't resume
+            try:
+                prog = self.import_job_progress(job, plan)
+            except Exception as e:
+                logger.warning(f"Could not read import progress: {e}")
+                prog = {"files_done": len(job.get("parts", {})),
+                        "files_total": len(plan.parts), "current_part": None,
+                        "pieces": None, "minutes_left": 0}
             out.append({"path": path, "plan": plan,
-                        "done": len(job.get("parts", {})), "total": len(plan.parts)})
+                        "done": prog["files_done"], "total": prog["files_total"],
+                        "progress": prog,
+                        "summary": self.describe_import_progress(prog),
+                        "updated": os.path.getmtime(path)})
+        out.sort(key=lambda j: j["updated"], reverse=True)
         return out
 
     @staticmethod
@@ -846,6 +1042,10 @@ class MeetingPipeline:
             if meta.attendees:
                 lines.append(f"**Speakers:** {', '.join(meta.attendees)}  ")
             lines.append("")
+            cov = self.transcript_coverage()
+            if cov and cov["incomplete"]:
+                from src.core.request_queue import coverage_warning
+                lines += [coverage_warning(cov["end"], cov["duration"]), ""]
             lines += context_markdown(meta)
             lines.append("## Transcript")
             lines.append("")
@@ -1107,6 +1307,10 @@ class MeetingPipeline:
             f"- **Transcript:** `{transcript_md}` (read this — no unzip needed)",
             "",
         ]
+        cov = self.transcript_coverage()
+        if cov and cov["incomplete"]:
+            from src.core.request_queue import coverage_warning
+            lines[3:3] = [coverage_warning(cov["end"], cov["duration"])]
         lines += context_markdown(meta)
         lines += ["## Documents requested", ""]
         for key in requested:

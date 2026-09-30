@@ -181,7 +181,7 @@ class BundleManager:
                 audio_name = audio_files[0]
                 audio_path = os.path.join(temp_dir, audio_name)
                 with zf.open(audio_name) as src, open(audio_path, 'wb') as dst:
-                    dst.write(src.read())
+                    shutil.copyfileobj(src, dst, 4 * 1024 * 1024)   # stream, don't load
 
             # List generated documents
             doc_files = [n for n in names if n.startswith("documents/")]
@@ -224,7 +224,9 @@ class BundleManager:
                 # Copy audio from old bundle (unchanged)
                 for name in old_zf.namelist():
                     if name.startswith("audio."):
-                        new_zf.writestr(name, old_zf.read(name))
+                        # Stream the (possibly hundreds of MB) audio across.
+                        with old_zf.open(name) as src, new_zf.open(name, "w") as dst:
+                            shutil.copyfileobj(src, dst, 4 * 1024 * 1024)
 
                 # Write updated transcript
                 if meeting.transcript:

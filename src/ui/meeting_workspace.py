@@ -69,6 +69,25 @@ class ImportThread(QThread):
             self.error.emit(str(e))
 
 
+class CompleteMissingThread(QThread):
+    """Background thread: transcribe only the untranscribed end of a meeting."""
+    finished_with = pyqtSignal(int)
+    error = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+    def __init__(self, pipeline: MeetingPipeline):
+        super().__init__()
+        self.pipeline = pipeline
+
+    def run(self):
+        try:
+            self.pipeline.on_progress = lambda msg: self.progress.emit(msg)
+            self.finished_with.emit(self.pipeline.complete_missing_transcript())
+        except Exception as e:
+            logger.error(f"Completing transcript failed: {e}", exc_info=True)
+            self.error.emit(str(e))
+
+
 class WhatsNextDialog(QDialog):
     """Shown after a meeting is saved: where things are and what to do next."""
 
@@ -96,6 +115,14 @@ class WhatsNextDialog(QDialog):
         if self.item:
             files.append(f"• <b>{os.path.basename(request_path)}</b> — request for: "
                          + ", ".join(self.item.documents))
+        from src.core.request_queue import bundle_coverage, coverage_warning, \
+            INCOMPLETE_GAP_SEC
+        cov = bundle_coverage(bundle_path)
+        if cov and cov["missing"] > INCOMPLETE_GAP_SEC:
+            warn = QLabel(coverage_warning(cov["end"], cov["duration"]).lstrip("> "))
+            warn.setWordWrap(True)
+            warn.setStyleSheet("color: #f59e0b; font-weight: 600;")
+            lay.addWidget(warn)
         info = QLabel("<br>".join(files) + f"<br><br>Folder: {self.folder}")
         info.setWordWrap(True)
         info.setTextFormat(Qt.TextFormat.RichText)
@@ -344,6 +371,25 @@ class MeetingWorkspace(QWidget):
         toolbar_layout.addWidget(self.save_btn)
 
         layout.addWidget(toolbar)
+
+        # ── Incomplete-transcript banner (hidden unless text is missing) ──
+        self.coverage_banner = QFrame()
+        self.coverage_banner.setStyleSheet(
+            "background-color: rgba(245, 158, 11, 0.12); "
+            "border-bottom: 1px solid rgba(245, 158, 11, 0.4);")
+        bl = QHBoxLayout(self.coverage_banner)
+        bl.setContentsMargins(20, 6, 20, 6)
+        self.coverage_label = QLabel("")
+        self.coverage_label.setStyleSheet("color: #f59e0b; font-weight: 600;")
+        self.coverage_label.setWordWrap(True)
+        bl.addWidget(self.coverage_label, 1)
+        self.complete_btn = QPushButton("  Transcribe missing part  ")
+        self.complete_btn.setToolTip("Transcribes ONLY the part without text and adds it "
+                                     "to this meeting — no second copy, no re-doing the rest.")
+        self.complete_btn.clicked.connect(self._on_complete_missing)
+        bl.addWidget(self.complete_btn)
+        self.coverage_banner.hide()
+        layout.addWidget(self.coverage_banner)
 
         # ── Progress Bar (hidden by default) ──
         self.progress_bar = QProgressBar()
@@ -655,6 +701,7 @@ class MeetingWorkspace(QWidget):
 
         self.title_label.setText(title)
         self.status_label.setText("Recording...")
+        self.coverage_banner.hide()
 
         # Clear previous content
         self.transcript_list.clear()
@@ -766,6 +813,7 @@ class MeetingWorkspace(QWidget):
     def start_import_plan(self, plan):
         """Run a confirmed (or resumed) import plan in the background."""
         self._import_plan = plan
+        self.coverage_banner.hide()
         self.title_label.setText(plan.title or plan.parts[0].name)
         self.transcript_list.clear()
         self.transcript_list.hide()
@@ -787,8 +835,8 @@ class MeetingWorkspace(QWidget):
         # Process button doubles as Cancel during import transcription
         self._is_processing = True
         self.process_btn.setText("  ✕ Cancel  ")
-        self.process_btn.setToolTip("Stop — finished parts are kept; import the "
-                                    "same files again to resume")
+        self.process_btn.setToolTip("Stop — finished parts are kept; resume later "
+                                    "from Home → Unfinished imports")
         self.process_btn.setEnabled(True)
         self.save_btn.setEnabled(False)
         self.status_label.setText("Importing...")
@@ -815,13 +863,14 @@ class MeetingWorkspace(QWidget):
             QMessageBox.information(
                 self, "Import paused",
                 "Transcription was stopped. Every part that finished is kept.\n\n"
-                "To continue later, import the same files again (or accept the "
-                "resume offer when the app starts) — finished parts won't be "
-                "transcribed again.\n\nSaving now would store only the partial "
-                "transcript.")
+                "To continue, go to Home → “Unfinished imports” → Resume "
+                "(it's also offered when the app starts). Finished parts and "
+                "10-minute pieces won't be transcribed again.\n\nSaving now "
+                "would store only the partial transcript.")
             return
 
         self.status_label.setText("Transcription complete!")
+        self._update_coverage_banner()
         plan = getattr(self, "_import_plan", None)
         if meeting and plan is not None and plan.auto_save:
             try:
@@ -939,6 +988,7 @@ class MeetingWorkspace(QWidget):
 
         if self.pipeline.meeting:
             self._populate_structured_data(self.pipeline.meeting)
+            self._update_coverage_banner()
 
             # Auto-prompt to save
             reply = QMessageBox.question(
@@ -1064,6 +1114,56 @@ class MeetingWorkspace(QWidget):
         self.process_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
         self._populate_structured_data(meeting)
+        self._update_coverage_banner()
+
+    # ─── Incomplete transcripts ──────────────────────────────────
+
+    def _update_coverage_banner(self):
+        cov = self.pipeline.transcript_coverage()
+        if not cov or not cov["incomplete"]:
+            self.coverage_banner.hide()
+            return
+        from src.core.request_queue import format_ts
+        self.coverage_label.setText(
+            f"⚠ Incomplete transcript — text covers 0:00–{format_ts(cov['end'])} of "
+            f"{format_ts(cov['duration'])}. About {round(cov['missing'] / 60)} min at the "
+            "end were never transcribed.")
+        self.complete_btn.setEnabled(True)
+        self.coverage_banner.show()
+
+    def _on_complete_missing(self):
+        if self.pipeline.state != PipelineState.IDLE:
+            QMessageBox.warning(self, "Busy", "Wait for the current task to finish first.")
+            return
+        self.complete_btn.setEnabled(False)
+        self.process_btn.setEnabled(False)
+        self.save_btn.setEnabled(False)
+        self.import_btn.setEnabled(False)
+        self.progress_bar.show()
+        self._complete_thread = CompleteMissingThread(self.pipeline)
+        self._complete_thread.progress.connect(self._on_progress_update)
+        self._complete_thread.finished_with.connect(self._on_complete_done)
+        self._complete_thread.error.connect(self._on_complete_error)
+        self._complete_thread.start()
+
+    def _on_complete_done(self, added: int):
+        self.progress_bar.hide()
+        self.process_btn.setEnabled(True)
+        self.save_btn.setEnabled(True)
+        self.import_btn.setEnabled(True)
+        if self.pipeline.meeting:
+            self._on_transcript_update(self.pipeline.meeting.transcript)
+        self._update_coverage_banner()
+        self.meeting_saved.emit()          # refresh Home (queue flag, search index)
+
+    def _on_complete_error(self, error: str):
+        self.progress_bar.hide()
+        self.complete_btn.setEnabled(True)
+        self.process_btn.setEnabled(True)
+        self.save_btn.setEnabled(True)
+        self.import_btn.setEnabled(True)
+        self.status_label.setText("Could not transcribe the missing part")
+        QMessageBox.warning(self, "Missing part", f"Could not transcribe the missing part:\n\n{error}")
 
     # ─── Documents ───────────────────────────────────────────────
 
