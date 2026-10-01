@@ -39,7 +39,7 @@ python -m venv venv
 .\venv\Scripts\Activate.ps1
 
 # Install dependencies (first time only, ~5-10 minutes)
-pip install -r gitignore\requirements.txt
+pip install -r requirements.txt
 
 # Optional but recommended: pre-download the Whisper model for offline use
 python scripts\download_models.py
@@ -119,7 +119,7 @@ Click **📂 Import audio / video** on Home, **File → Import Audio/Video** (Ct
 Then the app transcribes each part in turn onto **one timeline** (part 2 continues where part 1 ended), joins the audio, and — if *Save automatically* is ticked — saves the meeting and shows **"What's next"**.
 
 - **No conversion needed:** mp4 and mp3 are read directly (converting would only lose quality). Only the audio is kept; the video picture is dropped.
-- **Interrupted?** Finished parts are saved as they complete. Import the same files again — or accept the **"Unfinished import — Resume now"** offer when the app starts — and only the remaining parts are transcribed.
+- **Interrupted?** Finished parts — and every finished 10-minute Groq piece inside a part — are saved as they complete. Click **▶ Resume** under **Home → Unfinished imports** (or accept the **Resume now** offer when the app starts); only what's left is transcribed. The panel shows progress such as *"12 of 15 10-min pieces transcribed · ~25 min of audio left"*. Choosing **Later** keeps it in that panel.
 - **Long meetings on Groq's free tier** (2 audio-hours per clock-hour, 8 per day): a 7-hour meeting takes ~3 hours of mostly waiting; the app waits and continues on its own.
 
 ---
@@ -188,8 +188,8 @@ Local transcription of a 2–3 hour recording takes 1–3 hours of CPU time. The
 **How it behaves:**
 
 - Meetings **up to 2 hours**: transcribed in ~2–5 minutes.
-- **Longer meetings**: the free tier allows 2 audio-hours per clock-hour (8 hours/day). The app automatically splits your file, sends what it can, shows *"Waiting for quota window — X min until part N..."*, and continues by itself. A 4-hour recording completes in about 1 hour, hands-off.
-- **Crash-safe**: every finished part is saved to disk immediately. If the app closes mid-job, just click **Process** again — it resumes where it stopped without re-spending quota.
+- **Longer meetings**: the free tier allows 2 audio-hours per clock-hour (8 hours/day). The app automatically splits your file, sends what it can, shows *"Paused by Groq's hourly limit — continues automatically in X min (piece N of M). Don't cancel."*, and continues by itself. A "piece" is a 10-minute slice of the audio (not one of your files). A 4-hour recording completes in about 1 hour, hands-off.
+- **Crash-safe**: every finished piece is saved to disk immediately. If the app closes mid-job, resume it from **Home → Unfinished imports** (imports) or click **Process** again (recordings) — it continues where it stopped without re-spending quota.
 - **Automatic rollback**: if the cloud is unreachable (no internet, bad key), the app falls back to local Whisper on its own, so you always get a transcript. (Toggle in Settings.)
 
 **Privacy note:** with Groq selected, audio is sent to Groq's servers over TLS. For sensitive meetings, switch the backend to Local — everything then stays on your device.
@@ -273,7 +273,7 @@ Your saved `.mscribe` bundles, transcripts and generated documents are **never**
 ```
 Meeting Assistant/
 |-- main.py                    # Entry point
-|-- gitignore/requirements.txt # Python dependencies
+|-- requirements.txt           # Python dependencies
 |-- scripts/
 |   |-- download_models.py     # Pre-download Whisper models for offline use
 |   |-- convert_md_to_docx.py  # Command-line .md -> .docx conversion
@@ -328,7 +328,7 @@ Normal while nobody else speaks — Windows sends no system audio when nothing p
 Choose the language in the Import Wizard (step 3), add key terms (step 4), and avoid *tiny/base* models for non-English speech — use Groq or local *small* and up.
 
 **An import was interrupted**
-Restart the app and choose **Resume now**, or import the same files again — finished parts are reused.
+Open the app and click **▶ Resume** under **Home → Unfinished imports** (or **Resume now** in the start-up offer) — finished parts and pieces are reused.
 
 **"Transcribing..." seems stuck**
 First use downloads the model (up to 3 GB) — the status bar says so; let it finish once, or pre-download with `python scripts\download_models.py`. During transcription you should see a percentage and ETA. Click ✕ Cancel to stop and keep the partial transcript.
